@@ -212,7 +212,7 @@ function pack_input_tile!(
         end
         st
     end
-    I1 = g.xsize[1]
+    I1 = size(x, 1)                # unstuffed source extent
     stuff1 = iv.stuff[1]
     # Effective (stuffed) padded coordinate lo for dim 1 is lo[1] itself.
     lo1 = lo[1] - tile_origin[1] * s[1]   # shift so local output 0 maps to padded coordinate 0
@@ -231,7 +231,7 @@ function pack_input_tile!(
                     break
                 end
                 m = q ÷ stf
-                if m >= g.xsize[i + 1]
+                if m >= size(x, i + 1)
                     inside = false
                     break
                 end

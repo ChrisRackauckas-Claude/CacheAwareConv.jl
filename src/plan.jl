@@ -15,7 +15,9 @@ Keyword arguments follow the deep-learning convention: `stride`, `pad`
 dimension), `dilation`, channel `groups`, and `flipped` (`false` performs a
 true convolution with the kernel reversed, `true` a cross-correlation).
 `nthreads` is the maximum number of tasks used; `cache` overrides the cache
-sizes the blocking is derived from.
+sizes the blocking is derived from. The buffers needed by [`∇conv_data!`](@ref)
+and [`∇conv_filter!`](@ref) are allocated on first use unless
+`gradients = true`, which allocates them up front.
 
 See also [`plan_conv`](@ref), [`output_size`](@ref).
 """
@@ -39,6 +41,7 @@ struct ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}
     direct::Bool                  # kernel writes `y` directly
     nthreads::Int
     grad::Base.RefValue{Any}      # lazily built gradient state (see grad.jl)
+    lock::ReentrantLock
 end
 
 const SIMD_MIN_ITEMS_PER_THREAD = 1
@@ -151,10 +154,12 @@ end
 function ConvPlan(
         ::Type{T}, xsize::Dims{N}, wsize::Dims{N};
         stride = 1, pad = 0, dilation = 1, groups::Integer = 1, flipped::Bool = false,
-        nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info()
+        nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info(), gradients::Bool = false
     ) where {T, N}
     g = ConvGeometry(xsize, wsize; stride, pad, dilation, groups, flipped)
-    return ConvPlan(T, g; nthreads, cache)
+    p = ConvPlan(T, g; nthreads, cache)
+    gradients && grad_state(p)
+    return p
 end
 
 function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info()) where {T, N, S, P}
@@ -187,7 +192,7 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     ybufs = [Vector{Tc}(undef, ybuf_len) for _ in 1:(direct ? 0 : ntasks)]
     return ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}(
         g, cache, Kc, Nc, tile, map(cld, ntuple(i -> g.ysize[i], Val(S)), tile), Lp, W1, R,
-        xci_stride, xplane_stride, Lpy, taps, Wp, xbufs, ybufs, direct, ntasks, Ref{Any}(nothing)
+        xci_stride, xplane_stride, Lpy, taps, Wp, xbufs, ybufs, direct, ntasks, Ref{Any}(nothing), ReentrantLock()
     )
 end
 

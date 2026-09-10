@@ -2,23 +2,26 @@
 # around packing and the microkernel.
 
 """
-    conv!(y, x, w, plan::ConvPlan; bias = nothing, σ = identity)
+    conv!(y, x, w, plan::ConvPlan; bias = nothing, σ = identity, accumulate = false)
 
 Compute `y = σ.(conv(x, w) .+ bias)` in place using the pre-planned blocking.
-`bias`, if given, is a vector with one entry per output channel. All three
+`bias`, if given, is a vector with one entry per output channel. With
+`accumulate = true` the result is added to the existing contents of `y`
+instead (`y .+= conv(x, w) .+ bias`; `σ` must then be `identity`). All three
 arrays must have the plan's element type and sizes. Returns `y`.
 """
 function conv!(
         y::AbstractArray{T, N}, x::AbstractArray{T, N}, w::AbstractArray{T, N}, p::ConvPlan{T, Tc, N};
-        bias = nothing, σ::F = identity
+        bias = nothing, σ::F = identity, accumulate::Bool = false
     ) where {T, Tc, N, F}
     check_conv_args(p.geom, y, x, w)
     _check_bias(bias, channels_out(p.geom))
     _check_strided(y, "y")
     _check_strided(x, "x")
+    accumulate && σ !== identity && throw(ArgumentError("accumulate = true requires σ = identity"))
     S = N - 2
     iv = InputView(x, ntuple(_ -> 1, Val(S)))
-    _conv_impl!(y, iv, w, p, bias, σ, false)
+    _conv_impl!(y, iv, w, p, bias, σ, false, accumulate)
     return y
 end
 
@@ -114,14 +117,14 @@ end
 
 function _conv_impl!(
         y::AbstractArray{T, N}, iv::InputView, w::AbstractArray{<:Number, N},
-        p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}, bias, σ::F, conjw::Bool
+        p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}, bias, σ::F, conjw::Bool, accumulate::Bool
     ) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD, F}
     g = p.geom
     pack_weights!(p.Wp, w, g, p.Kc, NR, Val(NP), conjw)
     nitems = batch_size(g) * prod(p.nblocks)
     run_tasks(nitems, p.nthreads) do task, items
         for item in items
-            _work_item!(y, iv, p, bias, σ, task, item)
+            _work_item!(y, iv, p, bias, σ, accumulate, task, item)
         end
     end
     return y
@@ -129,7 +132,7 @@ end
 
 function _work_item!(
         y::AbstractArray{T, N}, iv::InputView, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD},
-        bias, σ::F, task::Int, item::Int
+        bias, σ::F, accumulate::Bool, task::Int, item::Int
     ) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD, F}
     g = p.geom
     G = g.groups
@@ -164,7 +167,7 @@ function _work_item!(
             ci0 = (grp - 1) * cin_g + (cb - 1) * Kc
             kc = min(Kc, cin_g - (cb - 1) * Kc)
             pack_input_tile!(Xp, iv, g, b, ci0, kc, origin, p.Lp, p.W1, p.R, p.xci_stride, p.xplane_stride, Val(NP), false)
-            acc = cb > 1
+            acc = cb > 1 || (accumulate && p.direct)
             ct = 1
             while ct <= ntiles
                 ct_end = min(ntiles, ct + tiles_per_block - 1)
@@ -218,7 +221,7 @@ function _work_item!(
                 _epilogue_direct!(y, g, b, origin, te, grp, cout_g, bias, σ)
             end
         else
-            _finalize_buffered!(y, Yb, p, b, origin, te, grp, cout_g, yb_rowstr, yb_costride, yb_planestride, bias, σ)
+            _finalize_buffered!(y, Yb, p, b, origin, te, grp, cout_g, yb_rowstr, yb_costride, yb_planestride, bias, σ, accumulate)
         end
     end
     return nothing
@@ -251,7 +254,7 @@ end
 
 function _finalize_buffered!(
         y::AbstractArray{T, N}, Yb::Vector{Tc}, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP},
-        b::Int, origin, te, grp::Int, cout_g::Int, yb_rowstr, yb_costride::Int, yb_planestride::Int, bias, σ::F
+        b::Int, origin, te, grp::Int, cout_g::Int, yb_rowstr, yb_costride::Int, yb_planestride::Int, bias, σ::F, accumulate::Bool
     ) where {T, Tc, N, S, P, V, MR, NR, NP, F}
     rows = CartesianIndices(ntuple(i -> te[i + 1], Val(S - 1)))
     @inbounds for co_l in 1:cout_g
@@ -265,7 +268,12 @@ function _finalize_buffered!(
             end
             for wo in 1:te[1]
                 v = _recombine(T, Yb, rbase + wo, yb_planestride, Val(NP))
-                y[origin[1] + wo, ntuple(i -> origin[i + 1] + r[i], Val(S - 1))..., co, b] = σ(v + bv)
+                I = (origin[1] + wo, ntuple(i -> origin[i + 1] + r[i], Val(S - 1))..., co, b)
+                if accumulate
+                    y[I...] += v + bv
+                else
+                    y[I...] = σ(v + bv)
+                end
             end
         end
     end
