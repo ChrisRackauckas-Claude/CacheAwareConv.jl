@@ -1,7 +1,7 @@
 module CacheAwareConv
 
 using SciMLPublic: @public
-using SIMD: Vec, vload, vstore, shufflevector
+using SIMD: Vec, vload, vstore
 using Static: known
 using CPUSummary: cache_size, cache_linesize
 using HostCPUFeatures: pick_vector_width, register_count
