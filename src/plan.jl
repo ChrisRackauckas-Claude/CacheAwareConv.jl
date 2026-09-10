@@ -241,7 +241,7 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     cout_g = channels_out(g) ÷ G
     Lpy = useflat ? W1 : cld(tile[1], V) * V
     direct = SIMD && (Tc === T) && NP == 1 && !useflat
-    ybuf_len = direct ? 0 : (useflat ? xci_stride : Lpy * prod(ntuple(i -> tile[i + 1], Val(S - 1)))) * cout_g * NP
+    ybuf_len = direct ? 0 : (useflat ? xci_stride + V : Lpy * prod(ntuple(i -> tile[i + 1], Val(S - 1)))) * cout_g * NP
     nitems = batch_size(g) * prod(map(cld, ntuple(i -> g.ysize[i], Val(S)), tile))
     ntasks = max(1, min(nt, nitems))
     # Overflow guard for 32-bit platforms.

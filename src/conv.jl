@@ -259,9 +259,11 @@ end
 Layout of the per-task output buffer: `[Lpy, tile[2:end]...]` per channel in
 row mode, or the packed-tile geometry `[W1, R[2:end]...]` in flat mode.
 """
-@inline function _ybuf_geometry(p::ConvPlan{T, Tc, N, S}) where {T, Tc, N, S}
+@inline function _ybuf_geometry(p::ConvPlan{T, Tc, N, S, P, V}) where {T, Tc, N, S, P, V}
     if p.flat
-        return _packed_rowstrides(p), p.xci_stride
+        # One vector of zero padding per channel: the weight-gradient kernel
+        # reads whole vectors past the end of a channel's region.
+        return _packed_rowstrides(p), p.xci_stride + V
     else
         rowstr = ntuple(Val(S - 1)) do i
             st = p.Lpy
