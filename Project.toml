@@ -1,0 +1,37 @@
+name = "CacheAwareConv"
+uuid = "ae0c0968-3b55-4cf5-aa46-61dd257e9e80"
+version = "0.1.0"
+authors = ["Oscar Smith <oscar.smith@juliahub.com> and contributors"]
+
+[deps]
+CPUSummary = "2a0fbf3d-bb9c-48f3-b0a9-814d99fd7ab9"
+HostCPUFeatures = "3e5b6fbb-0976-4d2c-9146-d79de83f2fb0"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
+SciMLPublic = "431bcebd-1456-4ced-9d72-93c2757fff0b"
+Static = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
+
+[weakdeps]
+ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+
+[extensions]
+CacheAwareConvChainRulesCoreExt = "ChainRulesCore"
+CacheAwareConvEnzymeCoreExt = "EnzymeCore"
+CacheAwareConvFluxExt = "Flux"
+CacheAwareConvLuxExt = "Lux"
+
+[compat]
+CPUSummary = "0.2.7"
+ChainRulesCore = "1.26"
+EnzymeCore = "0.8"
+Flux = "0.16"
+HostCPUFeatures = "0.1.18"
+Lux = "1.31"
+PrecompileTools = "1.2"
+SIMD = "3.7"
+SciMLPublic = "1"
+Static = "1"
+julia = "1.10"
