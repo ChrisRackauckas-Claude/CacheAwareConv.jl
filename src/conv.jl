@@ -129,7 +129,7 @@ function _conv_impl!(
         p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}, bias, σ::F, conjw::Bool, accumulate::Bool
     ) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD, F}
     g = p.geom
-    pack_weights!(p.Wp, w, g, p.Kc, NR, Val(NP), conjw)
+    pack_weights!(p.Wp, w, g, p.Kc, NR, Val(NP), conjw; ntasks = p.nthreads)
     nitems = batch_size(g) * prod(p.nblocks)
     run_tasks(nitems, p.nthreads) do task, items
         for item in items

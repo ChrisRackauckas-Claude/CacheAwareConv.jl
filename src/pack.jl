@@ -90,7 +90,7 @@ end
 end
 
 """
-    pack_weights!(Wp, w, g, Kc, NR, ::Val{NP}, ::Type{Tc}, conjugate)
+    pack_weights!(Wp, w, g, Kc, NR, ::Val{NP}, conjugate; ntasks = 1)
 
 Pack the weight array into the layout read by the microkernel. For every
 group, output-channel tile (`NR` channels, the last possibly fewer) and
@@ -98,41 +98,56 @@ input-channel block (`Kc` channels, the last possibly fewer), the block is a
 contiguous run over `(ci_local, tap)` of `NP * nr` values:
 `plane_1[1:nr], plane_2[1:nr], ...`. Taps are enumerated in the same order as
 [`tap_offsets`](@ref); kernel flipping is applied here.
+
+Packing is split over `ntasks` tasks by output tile: after a threaded
+convolution the previous packed weights sit in other cores' caches, and
+rewriting them from a single core is dominated by coherence traffic.
 """
 function pack_weights!(
         Wp::Vector{Tc}, w::AbstractArray{<:Number, N}, g::ConvGeometry{N, S},
-        Kc::Int, NR::Int, ::Val{NP}, conjugate::Bool
+        Kc::Int, NR::Int, ::Val{NP}, conjugate::Bool; ntasks::Int = 1
+    ) where {Tc, N, S, NP}
+    G = g.groups
+    cout_g = channels_out(g) ÷ G
+    ntiles = cld(cout_g, NR)
+    run_tasks(G * ntiles, ntasks) do _, items
+        for item in items
+            grp, ct = fldmod1(item, ntiles)
+            _pack_weight_tile!(Wp, w, g, Kc, NR, Val(NP), conjugate, grp, ct)
+        end
+    end
+    return Wp
+end
+
+function _pack_weight_tile!(
+        Wp::Vector{Tc}, w::AbstractArray{<:Number, N}, g::ConvGeometry{N, S},
+        Kc::Int, NR::Int, ::Val{NP}, conjugate::Bool, grp::Int, ct::Int
     ) where {Tc, N, S, NP}
     G = g.groups
     cin_g = channels_in(g) ÷ G
     cout_g = channels_out(g) ÷ G
-    K = prod(ntuple(i -> g.wsize[i], Val(S)))
     kspatial = CartesianIndices(ntuple(i -> g.wsize[i], Val(S)))
-    ntiles = cld(cout_g, NR)
     nblocks = cld(cin_g, Kc)
-    @inbounds for grp in 1:G, ct in 1:ntiles
-        co0 = (ct - 1) * NR
-        nr = min(NR, cout_g - co0)
-        for cb in 1:nblocks
-            ci0 = (cb - 1) * Kc
-            kc = min(Kc, cin_g - ci0)
-            off = weight_block_offset(g, Kc, NR, NP, grp, ct, cb)
-            idx = off
-            for ci_l in 1:kc
-                ci = ci0 + ci_l
-                for (t, k) in enumerate(kspatial)
-                    for p in 1:NP, j in 1:nr
-                        co = (grp - 1) * cout_g + co0 + j
-                        v = w[Tuple(k)..., ci, co]
-                        v = conjugate ? conj(v) : v
-                        Wp[idx + (p - 1) * nr + j] = convert(Tc, plane_value(v, Val(p)))
-                    end
-                    idx += NP * nr
+    co0 = (ct - 1) * NR
+    nr = min(NR, cout_g - co0)
+    @inbounds for cb in 1:nblocks
+        ci0 = (cb - 1) * Kc
+        kc = min(Kc, cin_g - ci0)
+        idx = weight_block_offset(g, Kc, NR, NP, grp, ct, cb)
+        for ci_l in 1:kc
+            ci = ci0 + ci_l
+            for k in kspatial
+                for p in 1:NP, j in 1:nr
+                    co = (grp - 1) * cout_g + co0 + j
+                    v = w[Tuple(k)..., ci, co]
+                    v = conjugate ? conj(v) : v
+                    Wp[idx + (p - 1) * nr + j] = convert(Tc, plane_value(v, Val(p)))
                 end
+                idx += NP * nr
             end
         end
     end
-    return Wp
+    return nothing
 end
 
 """
