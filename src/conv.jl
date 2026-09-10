@@ -184,21 +184,10 @@ function _work_item!(
                     co0 = (grp - 1) * cout_g + (t - 1) * NR
                     if p.flat
                         ybase = (t - 1) * NR * yb_costride
-                        f = 0
-                        while f < flatlen
-                            remaining = flatlen - f
-                            mr = min(MR, cld(remaining, V))
-                            lanes = remaining - (mr - 1) * V
-                            masked = lanes < V
-                            mask = lane_mask(Val(V), lanes)
-                            dispatch_microkernel!(
-                                Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, mr, nr, masked, mask,
-                                Yb, ybase + f, yb_costride, yb_planestride,
-                                Xp, f, p.xci_stride, p.xplane_stride,
-                                p.Wp, wbase, p.taps, K, kc
-                            )
-                            f += mr * V
-                        end
+                        _tile_row!(
+                            Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, nr, flatlen,
+                            Yb, ybase, yb_costride, yb_planestride, Xp, 0, p, wbase, K, kc
+                        )
                         continue
                     end
                     for r in rows
@@ -221,21 +210,10 @@ function _work_item!(
                             ycs = yb_costride
                             yps = yb_planestride
                         end
-                        wo = 0
-                        while wo < te[1]
-                            remaining = te[1] - wo
-                            mr = min(MR, cld(remaining, V))
-                            lanes = remaining - (mr - 1) * V
-                            masked = SIMD && lanes < V
-                            mask = lane_mask(Val(V), lanes)
-                            dispatch_microkernel!(
-                                Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, mr, nr, masked, mask,
-                                ydest, ybase + wo, ycs, yps,
-                                Xp, xrow + wo, p.xci_stride, p.xplane_stride,
-                                p.Wp, wbase, p.taps, K, kc
-                            )
-                            wo += mr * V
-                        end
+                        _tile_row!(
+                            Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, nr, te[1],
+                            ydest, ybase, ycs, yps, Xp, xrow, p, wbase, K, kc
+                        )
                     end
                 end
                 ct = ct_end + 1
@@ -249,6 +227,42 @@ function _work_item!(
         else
             _finalize_buffered!(y, Yb, p, b, origin, te, grp, cout_g, yb_rowstr, yb_costride, yb_planestride, bias, σ, accumulate)
         end
+    end
+    return nothing
+end
+
+"""
+    _tile_row!(Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, nr, len,
+               ydest, ybase, ycs, yps, Xp, xbase, p, wbase, K, kc)
+
+Run the microkernel over `len` consecutive output positions: all full
+`MR*V` tiles in a single call, then one (possibly masked) call for the tail.
+"""
+@inline function _tile_row!(
+        ::Val{SIMD}, ::Val{V}, ::Val{MR}, ::Val{NR}, ::Val{NP}, acc::Bool, nr::Int, len::Int,
+        ydest, ybase::Int, ycs::Int, yps::Int, Xp, xbase::Int, p::ConvPlan, wbase::Int, K::Int, kc::Int
+    ) where {SIMD, V, MR, NR, NP}
+    hoist = SIMD && NP == 1 && NR == 1 && kc == 1 && K <= MAX_HOISTED_TAPS
+    tilew = (hoist ? hoisted_mr(MR, K) : MR) * V
+    full = len ÷ tilew
+    if full > 0 && hoist
+        dispatch_hoisted!(Val(V), Val(MR), acc, K, ydest, ybase, Xp, xbase, p.Wp, wbase, p.taps, full)
+    elseif full > 0
+        dispatch_microkernel!(
+            Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, MR, nr, false, lane_mask(Val(V), V),
+            ydest, ybase, ycs, yps, Xp, xbase, p.xci_stride, p.xplane_stride, p.Wp, wbase, p.taps, K, kc, full
+        )
+    end
+    wo = full * tilew
+    remaining = len - wo
+    if remaining > 0
+        mr = cld(remaining, V)
+        lanes = remaining - (mr - 1) * V
+        masked = SIMD && lanes < V
+        dispatch_microkernel!(
+            Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, mr, nr, masked, lane_mask(Val(V), lanes),
+            ydest, ybase + wo, ycs, yps, Xp, xbase + wo, p.xci_stride, p.xplane_stride, p.Wp, wbase, p.taps, K, kc, 1
+        )
     end
     return nothing
 end

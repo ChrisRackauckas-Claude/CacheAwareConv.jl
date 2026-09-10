@@ -87,11 +87,17 @@ end
 Register-tile shape of the microkernel: `MR` vectors along the output width
 times `NR` output channels, chosen from the architecture's vector register
 count so that `nplanes * MR * NR` accumulators plus `nplanes * MR` input vectors
-and one broadcast fit without spilling.
+and one broadcast fit without spilling. With a single output channel per group
+(`cout == 1`, the stencil case) the tile is `MR × 1` with a larger `MR`.
 """
-function register_tile(::Type{Tc}, np::Int) where {Tc}
+function register_tile(::Type{Tc}, np::Int, cout::Int = typemax(Int)) where {Tc}
     simd_type(Tc) || return (4, 4)
     rc = Int(known(register_count()))::Int
+    if cout == 1
+        # Single output channel (stencils): spend the registers on width instead.
+        np == 1 && return rc >= 32 ? (8, 1) : rc >= 16 ? (4, 1) : (2, 1)
+        return rc >= 32 ? (4, 1) : rc >= 16 ? (2, 1) : (1, 1)
+    end
     if np == 1
         rc >= 32 && return (4, 6)
         rc >= 16 && return (2, 4)

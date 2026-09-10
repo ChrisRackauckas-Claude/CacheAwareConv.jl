@@ -21,11 +21,11 @@ _xv(i, p) = Symbol("x_", i, "_", p)
         ::Type{Vec{V, Tc}}, ::Val{MR}, ::Val{NR}, ::Val{NP}, ::Val{ACC}, ::Val{MASKED},
         yptr::Ptr{Tc}, y_co_stride::Int, y_plane_stride::Int,
         xptr::Ptr{Tc}, x_ci_stride::Int, x_plane_stride::Int,
-        wptr::Ptr{Tc}, taps::Ptr{Int}, K::Int, Kc::Int, mask::Vec{V, Bool}
+        wptr::Ptr{Tc}, taps::Ptr{Int}, K::Int, Kc::Int, mask::Vec{V, Bool}, nrep::Int
     ) where {V, Tc, MR, NR, NP, ACC, MASKED}
     VT = Vec{V, Tc}
     sz = sizeof(Tc)
-    yoff(i, j, p) = :(yptr + (($(j - 1)) * y_co_stride + $(p - 1) * y_plane_stride + $((i - 1) * V)) * $sz)
+    yoff(i, j, p) = :(yr + (($(j - 1)) * y_co_stride + $(p - 1) * y_plane_stride + $((i - 1) * V)) * $sz)
     init = Expr[]
     for p in 1:NP, j in 1:NR, i in 1:MR
         if ACC
@@ -57,19 +57,101 @@ _xv(i, p) = Symbol("x_", i, "_", p)
             push!(stores, :(vstore($(_acc(i, j, p)), $(yoff(i, j, p)))))
         end
     end
+    # `nrep` consecutive tiles along the width per call: amortises the call,
+    # tap-offset loads and accumulator setup when `K * Kc` is small.
     return quote
-        $(init...)
-        @inbounds for ci in 0:(Kc - 1)
-            xc = xptr + ci * x_ci_stride * $sz
-            wc = wptr + ci * K * $(NR * NP) * $sz
-            for t in 0:(K - 1)
-                xk = xc + unsafe_load(taps, t + 1) * $sz
-                wk = wc + t * $(NR * NP) * $sz
-                $(loads...)
-                $(fmas...)
+        @inbounds for rep in 0:(nrep - 1)
+            yr = yptr + rep * $(MR * V * sz)
+            xr = xptr + rep * $(MR * V * sz)
+            $(init...)
+            for ci in 0:(Kc - 1)
+                xc = xr + ci * x_ci_stride * $sz
+                wc = wptr + ci * K * $(NR * NP) * $sz
+                for t in 0:(K - 1)
+                    xk = xc + unsafe_load(taps, t + 1) * $sz
+                    wk = wc + t * $(NR * NP) * $sz
+                    $(loads...)
+                    $(fmas...)
+                end
             end
+            $(stores...)
         end
-        $(stores...)
+        return nothing
+    end
+end
+
+# Stencil variant: a single input channel, a single output channel, one plane,
+# and `K` known at compile time so that the `K` weight broadcasts and tap
+# offsets are loaded once per call and stay in registers across all `nrep`
+# tiles. Used when `Kc == 1 && NR == 1 && NP == 1 && K <= MAX_HOISTED_TAPS`;
+# for more than `HOISTED_FULL_MR_TAPS` taps the tile is narrowed so that the
+# weights, accumulators and one input vector still fit the register file.
+const MAX_HOISTED_TAPS = 27
+const HOISTED_FULL_MR_TAPS = 12
+
+"""
+    hoisted_mr(MR, K)
+
+Width (in vectors) of the hoisted stencil kernel's tile for `K` taps.
+"""
+hoisted_mr(MR::Int, K::Int) = K <= HOISTED_FULL_MR_TAPS ? MR : max(1, min(MR, 4))
+
+@generated function conv_microkernel_hoisted!(
+        ::Type{Vec{V, Tc}}, ::Val{MR}, ::Val{K}, ::Val{ACC},
+        yptr::Ptr{Tc}, xptr::Ptr{Tc}, wptr::Ptr{Tc}, taps::Ptr{Int}, nrep::Int
+    ) where {V, Tc, MR, K, ACC}
+    VT = Vec{V, Tc}
+    sz = sizeof(Tc)
+    wl = [:($(Symbol("w_", t)) = $VT(unsafe_load(wptr, $t))) for t in 1:K]
+    tl = [:($(Symbol("o_", t)) = unsafe_load(taps, $t) * $sz) for t in 1:K]
+    init = [ACC ? :($(_acc(i, 1, 1)) = vload($VT, yr + $((i - 1) * V * sz))) : :($(_acc(i, 1, 1)) = zero($VT)) for i in 1:MR]
+    body = Expr[]
+    for t in 1:K, i in 1:MR
+        push!(body, :($(_acc(i, 1, 1)) = muladd(vload($VT, xr + $(Symbol("o_", t)) + $((i - 1) * V * sz)), $(Symbol("w_", t)), $(_acc(i, 1, 1)))))
+    end
+    stores = [:(vstore($(_acc(i, 1, 1)), yr + $((i - 1) * V * sz))) for i in 1:MR]
+    return quote
+        $(wl...)
+        $(tl...)
+        @inbounds for rep in 0:(nrep - 1)
+            yr = yptr + rep * $(MR * V * sz)
+            xr = xptr + rep * $(MR * V * sz)
+            $(init...)
+            $(body...)
+            $(stores...)
+        end
+        return nothing
+    end
+end
+
+@generated function dispatch_hoisted!(
+        ::Val{V}, ::Val{MR}, acc::Bool, K::Int,
+        y::AbstractArray{Tc}, ybase::Int, Xp::Vector{Tc}, xbase::Int, Wp::Vector{Tc}, wbase::Int, taps::Vector{Int}, nrep::Int
+    ) where {Tc, V, MR}
+    ex = :(error("unreachable"))
+    for k in MAX_HOISTED_TAPS:-1:1
+        mrk = hoisted_mr(MR, k)
+        ex = :(
+            if K == $k
+                if acc
+                    conv_microkernel_hoisted!(Vec{$V, Tc}, Val($mrk), Val($k), Val(true), yptr, xptr, wptr, tptr, nrep)
+                else
+                    conv_microkernel_hoisted!(Vec{$V, Tc}, Val($mrk), Val($k), Val(false), yptr, xptr, wptr, tptr, nrep)
+                end
+            else
+                $ex
+            end
+        )
+    end
+    return quote
+        sz = sizeof(Tc)
+        yptr = pointer(y) + ybase * sz
+        xptr = pointer(Xp) + xbase * sz
+        wptr = pointer(Wp) + wbase * sz
+        tptr = pointer(taps)
+        GC.@preserve y Xp Wp taps begin
+            $ex
+        end
         return nothing
     end
 end
@@ -81,9 +163,9 @@ end
         ::Val{MR}, ::Val{NR}, ::Val{NP}, ::Val{ACC},
         y::AbstractArray{Tc}, ybase::Int, y_co_stride::Int, y_plane_stride::Int,
         Xp::Vector{Tc}, xbase::Int, x_ci_stride::Int, x_plane_stride::Int,
-        Wp::Vector{Tc}, wbase::Int, taps::Vector{Int}, K::Int, Kc::Int
+        Wp::Vector{Tc}, wbase::Int, taps::Vector{Int}, K::Int, Kc::Int, nrep::Int
     ) where {Tc, MR, NR, NP, ACC}
-    yidx(i, j, p) = :(ybase + ($(j - 1)) * y_co_stride + $(p - 1) * y_plane_stride + $(i))
+    yidx(i, j, p) = :(yb + ($(j - 1)) * y_co_stride + $(p - 1) * y_plane_stride + $(i))
     init = Expr[]
     for p in 1:NP, j in 1:NR, i in 1:MR
         if ACC
@@ -108,18 +190,22 @@ end
         push!(stores, :(y[$(yidx(i, j, p))] = $(_acc(i, j, p))))
     end
     return quote
-        $(init...)
-        @inbounds for ci in 0:(Kc - 1)
-            xc = xbase + ci * x_ci_stride
-            wc = wbase + ci * K * $(NR * NP)
-            for t in 0:(K - 1)
-                xk = xc + taps[t + 1]
-                wk = wc + t * $(NR * NP)
-                $(loads...)
-                $(fmas...)
+        @inbounds for rep in 0:(nrep - 1)
+            yb = ybase + rep * $MR
+            xb = xbase + rep * $MR
+            $(init...)
+            for ci in 0:(Kc - 1)
+                xc = xb + ci * x_ci_stride
+                wc = wbase + ci * K * $(NR * NP)
+                for t in 0:(K - 1)
+                    xk = xc + taps[t + 1]
+                    wk = wc + t * $(NR * NP)
+                    $(loads...)
+                    $(fmas...)
+                end
             end
+            $(stores...)
         end
-        $(stores...)
         return nothing
     end
 end
@@ -129,18 +215,18 @@ end
                           acc, mr, nr, masked, mask,
                           y, ybase, y_co_stride, y_plane_stride,
                           Xp, xbase, x_ci_stride, x_plane_stride,
-                          Wp, wbase, taps, K, Kc)
+                          Wp, wbase, taps, K, Kc, nrep)
 
-Run the microkernel instantiation for a possibly-partial tile of `mr ≤ MR`
-vectors and `nr ≤ NR` channels. `ybase`, `xbase`, `wbase` are 0-based element
-offsets into `y`, `Xp`, `Wp`.
+Run the microkernel instantiation for `nrep` consecutive tiles of `mr ≤ MR`
+vectors and `nr ≤ NR` channels (a partial tile is always a single repetition).
+`ybase`, `xbase`, `wbase` are 0-based element offsets into `y`, `Xp`, `Wp`.
 """
 @generated function dispatch_microkernel!(
         ::Val{SIMD}, ::Val{V}, ::Val{MR}, ::Val{NR}, ::Val{NP},
         acc::Bool, mr::Int, nr::Int, masked::Bool, mask::Vec{V, Bool},
         y::AbstractArray{Tc}, ybase::Int, y_co_stride::Int, y_plane_stride::Int,
         Xp::Vector{Tc}, xbase::Int, x_ci_stride::Int, x_plane_stride::Int,
-        Wp::Vector{Tc}, wbase::Int, taps::Vector{Int}, K::Int, Kc::Int
+        Wp::Vector{Tc}, wbase::Int, taps::Vector{Int}, K::Int, Kc::Int, nrep::Int
     ) where {SIMD, Tc, V, MR, NR, NP}
     function call(mrv, nrv, accv, maskedv)
         if SIMD
@@ -148,7 +234,7 @@ offsets into `y`, `Xp`, `Wp`.
                 conv_microkernel!(
                     Vec{$V, Tc}, Val($mrv), Val($nrv), Val($NP), Val($accv), Val($maskedv),
                     yptr, y_co_stride, y_plane_stride, xptr, x_ci_stride, x_plane_stride,
-                    wptr, tptr, K, Kc, mask
+                    wptr, tptr, K, Kc, mask, nrep
                 )
             )
         else
@@ -156,7 +242,7 @@ offsets into `y`, `Xp`, `Wp`.
                 conv_microkernel_scalar!(
                     Val($mrv), Val($nrv), Val($NP), Val($accv),
                     y, ybase, y_co_stride, y_plane_stride, Xp, xbase, x_ci_stride, x_plane_stride,
-                    Wp, wbase, taps, K, Kc
+                    Wp, wbase, taps, K, Kc, nrep
                 )
             )
         end

@@ -42,25 +42,47 @@ is element `m` (0-based) of the source row; `conj` conjugates complex values.
         src::AbstractArray, soff::Int, sstride::Int, I::Int, lo::Int, stuff::Int,
         xplane_stride::Int, ::Val{NP}, conjugate::Bool
     ) where {Tc, NP}
-    # Zero the whole segment on every plane, then scatter the valid entries.
-    @inbounds for p in 0:(NP - 1)
-        base = doff + p * xplane_stride
-        for j in 1:Lp
-            dst[base + j] = zero(Tc)
-        end
-    end
     # Valid j satisfy 0 <= q - lo <= (I-1)*stuff and (q - lo) % stuff == 0,
     # with q = j*s + ph.
     Lstuffed = (I - 1) * stuff + 1
     jlo = max(0, cld(lo - ph, s))
     jhi = min(Lp - 1, fld(lo + Lstuffed - 1 - ph, s))
-    jlo > jhi && return nothing
+    if jlo > jhi
+        @inbounds for p in 0:(NP - 1)
+            base = doff + p * xplane_stride
+            for j in 1:Lp
+                dst[base + j] = zero(Tc)
+            end
+        end
+        return nothing
+    end
+    # Zero only the borders (and, when stuffing, the whole segment).
+    @inbounds for p in 0:(NP - 1)
+        base = doff + p * xplane_stride
+        zhi = stuff == 1 ? jlo : Lp
+        for j in 1:zhi
+            dst[base + j] = zero(Tc)
+        end
+        for j in (jhi + 2):Lp
+            dst[base + j] = zero(Tc)
+        end
+    end
     if stuff == 1
-        @inbounds for j in jlo:jhi
-            m = j * s + ph - lo
-            v = src[soff + m * sstride + 1]
-            v = conjugate ? conj(v) : v
-            _store_planes!(dst, doff + j + 1, xplane_stride, v, Val(NP))
+        m0 = jlo * s + ph - lo                     # 0-based source index of j = jlo
+        n = jhi - jlo + 1
+        if NP == 1 && !conjugate && sstride == 1 && s == 1 && eltype(src) === Tc && src isa StridedArray
+            # Contiguous real copy: the common case for the forward pass.
+            copyto!(dst, doff + jlo + 1, src, soff + m0 + 1, n)
+        elseif NP == 1 && !conjugate && sstride == 1
+            @inbounds @simd for t in 0:(n - 1)
+                dst[doff + jlo + t + 1] = convert(Tc, plane_value(src[soff + m0 + t * s + 1], Val(1)))
+            end
+        else
+            @inbounds for t in 0:(n - 1)
+                v = src[soff + (m0 + t * s) * sstride + 1]
+                v = conjugate ? conj(v) : v
+                _store_planes!(dst, doff + jlo + t + 1, xplane_stride, v, Val(NP))
+            end
         end
     else
         @inbounds for j in jlo:jhi

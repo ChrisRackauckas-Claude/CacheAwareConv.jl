@@ -229,7 +229,7 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     NP = nplanes(T)
     SIMD = simd_type(Tc)
     V = vector_width(Tc)
-    MR, NR = register_tile(Tc, NP)
+    MR, NR = register_tile(Tc, NP, channels_out(g) ÷ g.groups)
     nt = max(1, Int(nthreads))
     Kc, Nc, tile = choose_blocking(g, Tc, NP, V, MR, NR, cache, nt)
     useflat = flat === nothing ? use_flat_mode(g, tile, V, MR) : (flat && S >= 2 && all(==(1), g.stride))

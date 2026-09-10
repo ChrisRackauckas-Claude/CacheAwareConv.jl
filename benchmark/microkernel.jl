@@ -17,7 +17,7 @@ function kernel_peak(::Type{T}) where {T}
     mask = CacheAwareConv.lane_mask(Val(V), V)
     f() = GC.@preserve Xp Wp Y taps conv_microkernel!(
         Vec{V, Tc}, Val(MR), Val(NR), Val(NP), Val(false), Val(false),
-        pointer(Y), MR * V, MR * V * NR, pointer(Xp), Lp, Kc * Lp, pointer(Wp), pointer(taps), K, Kc, mask
+        pointer(Y), MR * V, MR * V * NR, pointer(Xp), Lp, Kc * Lp, pointer(Wp), pointer(taps), K, Kc, mask, 1
     )
     f()
     t = @belapsed $f()
