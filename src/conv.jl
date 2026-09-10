@@ -159,16 +159,14 @@ function _work_item!(
     rowstr = _packed_rowstrides(p)
     rows = CartesianIndices(ntuple(i -> te[i + 1], Val(S - 1)))
     ystr = strides(y)
-    # Buffered-output layout: [Lpy, tile[2:end]..., cout_g, NP]
-    yb_rowstr = ntuple(Val(S - 1)) do i
-        st = p.Lpy
-        for j in 2:i
-            st *= p.tile[j]
-        end
-        st
-    end
-    yb_costride = p.Lpy * prod(ntuple(i -> p.tile[i + 1], Val(S - 1)))
+    yb_rowstr, yb_costride = _ybuf_geometry(p)
     yb_planestride = yb_costride * cout_g
+    # Flat mode: one pass over the packed tile treated as a single vector of
+    # length F (all rows of the tile including the halo columns between them).
+    flatlen = 1
+    for i in 1:S
+        flatlen += (te[i] - 1) * (i == 1 ? 1 : rowstr[i - 1])
+    end
     Yb = p.direct ? Xp : p.ybufs[task]   # Xp is a placeholder of the right type when direct
     ydest = p.direct ? y : Yb
     for grp in 1:G
@@ -184,6 +182,25 @@ function _work_item!(
                     nr = min(NR, cout_g - (t - 1) * NR)
                     wbase = weight_block_offset(g, Kc, NR, NP, grp, t, cb)
                     co0 = (grp - 1) * cout_g + (t - 1) * NR
+                    if p.flat
+                        ybase = (t - 1) * NR * yb_costride
+                        f = 0
+                        while f < flatlen
+                            remaining = flatlen - f
+                            mr = min(MR, cld(remaining, V))
+                            lanes = remaining - (mr - 1) * V
+                            masked = lanes < V
+                            mask = lane_mask(Val(V), lanes)
+                            dispatch_microkernel!(
+                                Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, mr, nr, masked, mask,
+                                Yb, ybase + f, yb_costride, yb_planestride,
+                                Xp, f, p.xci_stride, p.xplane_stride,
+                                p.Wp, wbase, p.taps, K, kc
+                            )
+                            f += mr * V
+                        end
+                        continue
+                    end
                     for r in rows
                         xrow = 0
                         for i in 1:(S - 1)
@@ -234,6 +251,27 @@ function _work_item!(
         end
     end
     return nothing
+end
+
+"""
+    _ybuf_geometry(p) -> (rowstrides, channel stride)
+
+Layout of the per-task output buffer: `[Lpy, tile[2:end]...]` per channel in
+row mode, or the packed-tile geometry `[W1, R[2:end]...]` in flat mode.
+"""
+@inline function _ybuf_geometry(p::ConvPlan{T, Tc, N, S}) where {T, Tc, N, S}
+    if p.flat
+        return _packed_rowstrides(p), p.xci_stride
+    else
+        rowstr = ntuple(Val(S - 1)) do i
+            st = p.Lpy
+            for j in 2:i
+                st *= p.tile[j]
+            end
+            st
+        end
+        return rowstr, p.Lpy * prod(ntuple(i -> p.tile[i + 1], Val(S - 1)))
+    end
 end
 
 @inline _bias_at(::Nothing, ::Type{T}, co) where {T} = zero(T)

@@ -2,6 +2,15 @@
 # geometry, cache-derived blocking, tap offsets, and all scratch buffers.
 
 """
+    GradSlot
+
+Mutable holder for the lazily created gradient state of a plan.
+"""
+mutable struct GradSlot
+    state::Any
+end
+
+"""
     ConvPlan(T, xsize, wsize; stride = 1, pad = 0, dilation = 1, groups = 1,
              flipped = false, nthreads = Threads.nthreads(), cache = cache_info())
 
@@ -17,7 +26,8 @@ true convolution with the kernel reversed, `true` a cross-correlation).
 `nthreads` is the maximum number of tasks used; `cache` overrides the cache
 sizes the blocking is derived from. The buffers needed by [`∇conv_data!`](@ref)
 and [`∇conv_filter!`](@ref) are allocated on first use unless
-`gradients = true`, which allocates them up front.
+`gradients = true`, which allocates them up front. `flat` forces the
+flattened-row traversal for narrow outputs on or off (default: automatic).
 
 See also [`plan_conv`](@ref), [`output_size`](@ref).
 """
@@ -39,17 +49,24 @@ struct ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}
     xbufs::Vector{Vector{Tc}}     # per-task packed input tiles
     ybufs::Vector{Vector{Tc}}     # per-task output accumulation tiles (empty when direct)
     direct::Bool                  # kernel writes `y` directly
+    flat::Bool                    # flattened-row mode for narrow outputs (see conv.jl)
     nthreads::Int
-    grad::Base.RefValue{Any}      # lazily built gradient state (see grad.jl)
+    grad::GradSlot                # lazily built gradient state (see grad.jl)
     lock::ReentrantLock
 end
+
+
+# Replace element `i` of a tuple.
+@inline _settuple(t::NTuple{S, Int}, v::Int, i::Int) where {S} = ntuple(j -> j == i ? v : t[j], Val(S))
 
 const SIMD_MIN_ITEMS_PER_THREAD = 1
 
 _sz(::Type{Tc}) where {Tc} = isbitstype(Tc) ? sizeof(Tc) : 2 * sizeof(Int)
 
-function _packed_extents(g::ConvGeometry{N, S}, tile::NTuple{S, Int}, V::Int) where {N, S}
-    Lp = cld(tile[1], V) * V + max_tap_shift(g)
+function _packed_extents(g::ConvGeometry{N, S}, tile::NTuple{S, Int}, V::Int, flat::Bool = false) where {N, S}
+    # In flat mode the row pitch is not rounded up to the vector width: rows
+    # are traversed as one long vector and the kernel reads across row ends.
+    Lp = (flat ? tile[1] : cld(tile[1], V) * V) + max_tap_shift(g)
     W1 = g.stride[1] * Lp
     R = ntuple(Val(S)) do i
         i == 1 ? W1 : (tile[i] - 1) * g.stride[i] + (g.wsize[i] - 1) * g.dilation[i] + 1
@@ -98,51 +115,21 @@ function choose_blocking(g::ConvGeometry{N, S}, ::Type{Tc}, NP::Int, V::Int, MR:
     O = ntuple(i -> g.ysize[i], Val(S))
     Kc = clamp(fld(cache.l1 ÷ 2, K * NR * NP * sz), 1, cin_g)
     budget = cache.l2 ÷ 2
-    fits(tile, kc) = _tile_bytes(g, kc, NP, V, tile, sz) <= budget
-    tile = O
+    fits = _TileFits(g, NP, V, sz, budget)
     minw = min(O[1], MR * V)
-    while true
-        tile = O
-        fits(tile, Kc) && break
-        # shrink trailing spatial dims
-        found = false
-        for i in S:-1:2
-            t1 = Base.setindex(tile, 1, i)
-            if fits(t1, Kc)
-                ti = _largest_true(t -> fits(Base.setindex(tile, t, i), Kc), 1, O[i])
-                tile = Base.setindex(tile, ti, i)
-                found = true
-                break
-            else
-                tile = t1
-            end
-        end
-        found && break
-        # shrink width in multiples of MR*V
-        nunits = cld(O[1], MR * V)
-        if fits(Base.setindex(tile, minw, 1), Kc)
-            u = _largest_true(u -> fits(Base.setindex(tile, min(O[1], u * MR * V), 1), Kc), 1, nunits)
-            tile = Base.setindex(tile, min(O[1], u * MR * V), 1)
-            break
-        end
-        if Kc == 1
-            tile = Base.setindex(tile, minw, 1)
-            break
-        end
-        Kc = max(1, Kc ÷ 2)
-    end
+    Kc, tile = _search_tile(g, Kc, O, minw, fits, MR, V, Val(S))
     # Ensure enough work items for the threads (split trailing dims, then width).
     nitems(t) = batch_size(g) * prod(map(cld, O, t))
     for i in S:-1:2
         nitems(tile) >= nthreads && break
         while nitems(tile) < nthreads && tile[i] > 1
-            tile = Base.setindex(tile, cld(tile[i], 2), i)
+            tile = _settuple(tile, cld(tile[i], 2), i)
         end
     end
     if nitems(tile) < nthreads
         while nitems(tile) < nthreads && tile[1] > MR * V
             units = cld(tile[1], MR * V)
-            tile = Base.setindex(tile, cld(units, 2) * MR * V, 1)
+            tile = _settuple(tile, cld(units, 2) * MR * V, 1)
         end
     end
     tile = map(min, tile, O)
@@ -151,18 +138,92 @@ function choose_blocking(g::ConvGeometry{N, S}, ::Type{Tc}, NP::Int, V::Int, MR:
     return Kc, Nc, tile
 end
 
+# Predicates for the tile search (plain structs rather than closures so that
+# the captured state is explicit and concretely typed).
+struct _TileFits{G <: ConvGeometry}
+    g::G
+    NP::Int
+    V::Int
+    sz::Int
+    budget::Int
+end
+(f::_TileFits)(tile, kc::Int) = _tile_bytes(f.g, kc, f.NP, f.V, tile, f.sz) <= f.budget
+
+struct _DimProbe{F, S}
+    fits::F
+    base::NTuple{S, Int}
+    kc::Int
+    i::Int
+end
+(p::_DimProbe)(t::Int) = p.fits(_settuple(p.base, t, p.i), p.kc)
+
+struct _WidthProbe{F, S}
+    fits::F
+    base::NTuple{S, Int}
+    kc::Int
+    O1::Int
+    unit::Int
+end
+(p::_WidthProbe)(u::Int) = p.fits(_settuple(p.base, min(p.O1, u * p.unit), 1), p.kc)
+
+# Largest tile (and possibly reduced Kc) for which the packed tile fits the L2 budget.
+function _search_tile(g::ConvGeometry, Kc::Int, O::NTuple{S, Int}, minw::Int, fits::FT, MR::Int, V::Int, ::Val{S}) where {S, FT}
+    tile = O
+    while true
+        tile = O
+        fits(tile, Kc) && return Kc, tile
+        # shrink trailing spatial dims
+        for i in S:-1:2
+            t1 = _settuple(tile, 1, i)
+            if fits(t1, Kc)
+                ti = _largest_true(_DimProbe(fits, tile, Kc, i), 1, O[i])
+                return Kc, _settuple(tile, ti, i)
+            else
+                tile = t1
+            end
+        end
+        # shrink width in multiples of MR*V
+        nunits = cld(O[1], MR * V)
+        if fits(_settuple(tile, minw, 1), Kc)
+            u = _largest_true(_WidthProbe(fits, tile, Kc, O[1], MR * V), 1, nunits)
+            return Kc, _settuple(tile, min(O[1], u * MR * V), 1)
+        end
+        Kc == 1 && return Kc, _settuple(tile, minw, 1)
+        Kc = max(1, Kc ÷ 2)
+    end
+    return
+end
+
 function ConvPlan(
         ::Type{T}, xsize::Dims{N}, wsize::Dims{N};
         stride = 1, pad = 0, dilation = 1, groups::Integer = 1, flipped::Bool = false,
-        nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info(), gradients::Bool = false
+        nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info(), gradients::Bool = false,
+        flat::Union{Nothing, Bool} = nothing
     ) where {T, N}
     g = ConvGeometry(xsize, wsize; stride, pad, dilation, groups, flipped)
-    p = ConvPlan(T, g; nthreads, cache)
+    p = ConvPlan(T, g; nthreads, cache, flat)
     gradients && grad_state(p)
     return p
 end
 
-function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info()) where {T, N, S, P}
+"""
+    use_flat_mode(g, tile, V, MR) -> Bool
+
+Whether to traverse the packed tile as one flat vector (see `conv.jl`).
+Only possible for unit strides and more than one spatial dimension; chosen
+when it wastes noticeably fewer SIMD lanes than row-by-row traversal.
+"""
+function use_flat_mode(g::ConvGeometry{N, S}, tile::NTuple{S, Int}, V::Int, MR::Int) where {N, S}
+    S >= 2 || return false
+    V > 1 || return false
+    all(==(1), g.stride) || return false
+    _, _, R = _packed_extents(g, tile, V, true)
+    flat_util = prod(tile) / (R[1] * prod(ntuple(i -> R[i + 1], Val(S - 1))))
+    row_util = tile[1] / (cld(tile[1], V) * V)
+    return flat_util > 1.15 * row_util
+end
+
+function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info(), flat::Union{Nothing, Bool} = nothing) where {T, N, S, P}
     T <: Number || throw(ArgumentError("element type must be a Number, got $T"))
     Tc = compute_type(T)
     NP = nplanes(T)
@@ -171,15 +232,16 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     MR, NR = register_tile(Tc, NP)
     nt = max(1, Int(nthreads))
     Kc, Nc, tile = choose_blocking(g, Tc, NP, V, MR, NR, cache, nt)
-    Lp, W1, R = _packed_extents(g, tile, V)
+    useflat = flat === nothing ? use_flat_mode(g, tile, V, MR) : (flat && S >= 2 && all(==(1), g.stride))
+    Lp, W1, R = _packed_extents(g, tile, V, useflat)
     xci_stride = prod(R)
     xplane_stride = xci_stride * Kc
-    xbuf_len = xplane_stride * NP
+    xbuf_len = xplane_stride * NP + (useflat ? V : 0)     # slack: flat mode reads past the last row
     G = g.groups
     cout_g = channels_out(g) ÷ G
-    Lpy = cld(tile[1], V) * V
-    direct = SIMD && (Tc === T) && NP == 1
-    ybuf_len = direct ? 0 : Lpy * prod(ntuple(i -> tile[i + 1], Val(S - 1))) * cout_g * NP
+    Lpy = useflat ? W1 : cld(tile[1], V) * V
+    direct = SIMD && (Tc === T) && NP == 1 && !useflat
+    ybuf_len = direct ? 0 : (useflat ? xci_stride : Lpy * prod(ntuple(i -> tile[i + 1], Val(S - 1)))) * cout_g * NP
     nitems = batch_size(g) * prod(map(cld, ntuple(i -> g.ysize[i], Val(S)), tile))
     ntasks = max(1, min(nt, nitems))
     # Overflow guard for 32-bit platforms.
@@ -188,11 +250,13 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     end
     taps = tap_offsets(g, Lp, W1, R)
     Wp = Vector{Tc}(undef, packed_weight_length(g, NP))
-    xbufs = [Vector{Tc}(undef, xbuf_len) for _ in 1:ntasks]
+    # Zero-initialised: the flat-mode slack past the last row is read (and
+    # multiplied by zeros) but never written, so it must not hold NaNs.
+    xbufs = [zeros(Tc, xbuf_len) for _ in 1:ntasks]
     ybufs = [Vector{Tc}(undef, ybuf_len) for _ in 1:(direct ? 0 : ntasks)]
     return ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}(
         g, cache, Kc, Nc, tile, map(cld, ntuple(i -> g.ysize[i], Val(S)), tile), Lp, W1, R,
-        xci_stride, xplane_stride, Lpy, taps, Wp, xbufs, ybufs, direct, ntasks, Ref{Any}(nothing), ReentrantLock()
+        xci_stride, xplane_stride, Lpy, taps, Wp, xbufs, ybufs, direct, useflat, ntasks, GradSlot(nothing), ReentrantLock()
     )
 end
 
@@ -209,9 +273,35 @@ function plan_conv(x::AbstractArray{<:Number, N}, w::AbstractArray{<:Number, N};
     throw(ArgumentError("x and w must have the same element type; got $(eltype(x)) and $(eltype(w)). Convert one of them first."))
 end
 
+"""
+    geometry(plan::ConvPlan) -> ConvGeometry
+
+The [`ConvGeometry`](@ref) a plan was built for.
+"""
 geometry(p::ConvPlan) = p.geom
-for f in (:output_size, :input_size, :kernel_size, :channels_in, :channels_out, :batch_size, :groups, :flipped, :stride, :padding, :dilation, :spatial_dims)
-    @eval $f(p::ConvPlan) = $f(p.geom)
+for (f, doc) in (
+        (:output_size, "size of the output array `(spatial_out..., C_out, batch)`"),
+        (:input_size, "size of the input array `(spatial..., C_in, batch)`"),
+        (:kernel_size, "size of the weight array `(k..., C_in ÷ groups, C_out)`"),
+        (:channels_in, "number of input channels"),
+        (:channels_out, "number of output channels"),
+        (:batch_size, "batch size"),
+        (:groups, "number of channel groups"),
+        (:flipped, "`false` for a true convolution (kernel reversed), `true` for cross-correlation"),
+        (:stride, "stride per spatial dimension"),
+        (:padding, "zero padding as `(lo_1, hi_1, …, lo_S, hi_S)`"),
+        (:dilation, "dilation per spatial dimension"),
+        (:spatial_dims, "number of spatial dimensions"),
+    )
+    @eval begin
+        """
+            $($(string(f)))(g::ConvGeometry)
+            $($(string(f)))(plan::ConvPlan)
+
+        Return the $($doc).
+        """
+        $f(p::ConvPlan) = $f(p.geom)
+    end
 end
 Base.eltype(::ConvPlan{T}) where {T} = T
 compute_type(::ConvPlan{T, Tc}) where {T, Tc} = Tc
@@ -224,7 +314,7 @@ function Base.show(io::IO, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}) whe
     print(io, "ConvPlan{", T, "}(", g.xsize, " ⋆ ", g.wsize, " → ", g.ysize)
     print(io, "; stride=", g.stride, ", pad=", g.pad, ", dilation=", g.dilation, ", groups=", g.groups, ", flipped=", g.flipped)
     print(io, ") [", SIMD ? "SIMD " : "scalar ", Tc, " V=", V, " MR=", MR, " NR=", NR, " NP=", NP)
-    print(io, " Kc=", p.Kc, " Nc=", p.Nc, " tile=", p.tile, " tasks=", p.nthreads, "]")
+    print(io, " Kc=", p.Kc, " Nc=", p.Nc, " tile=", p.tile, p.flat ? " flat" : "", " tasks=", p.nthreads, "]")
     return nothing
 end
 

@@ -53,6 +53,20 @@ trick); `re = a₁ − a₂` and `im = a₃ − a₁ − a₂` are recombined on
 This was measured about 30% faster than the four-multiply form because it
 needs three loads per three FMAs and fewer accumulators per useful product.
 
+## Narrow outputs: flat-row mode
+
+When the output width is not a multiple of the vector width, the last vector
+of every row wastes lanes; for the 7×7 and 14×14 feature maps common late in a
+CNN that costs more than half the throughput. For unit strides the packed
+tile has a constant row pitch, so the kernel can instead treat the whole tile
+(all rows, including the halo columns between them) as one long vector and
+store into a per-task output buffer with the same geometry. The halo positions
+produce garbage that the final copy skips. The plan picks this mode when it
+wastes at least 15% fewer lanes than row-by-row traversal (shown as `flat` in
+the plan summary; `flat = true/false` forces it). The weight-gradient kernel
+uses the same trick, with the packed output-gradient tile zero everywhere
+outside the valid region.
+
 ## Choosing the blocks from the cache sizes
 
 With `sz` the size of a packed element and `K = ∏ kernel size`:
@@ -108,8 +122,8 @@ one task, so the result is bitwise identical for any thread count.
   much larger kernels an FFT-based method needs far fewer operations; the
   blocking here keeps the direct kernel at full FMA rate for any kernel size,
   but does not change the operation count.
-- Outputs whose width is not a multiple of the vector width waste lanes in
-  the last vector. A flattened-row mode for narrow outputs is planned.
+- Flat-row mode requires unit strides; strided narrow outputs still waste
+  lanes in the last vector of each row.
 - The stride-`s` data gradient zero-stuffs the output gradient and therefore
   performs `∏ s` times the necessary multiply-adds; a phase decomposition
   would remove this.

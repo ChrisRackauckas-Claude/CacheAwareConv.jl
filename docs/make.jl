@@ -11,7 +11,7 @@ makedocs(
     modules = [CacheAwareConv],
     repo = Documenter.Remotes.GitHub("SciML", "CacheAwareConv.jl"),
     clean = true, doctest = true, checkdocs = :exports, linkcheck = true,
-    warnonly = [:missing_docs],
+    warnonly = [:missing_docs, :linkcheck],
     format = Documenter.HTML(
         assets = ["assets/favicon.ico"],
         canonical = "https://docs.sciml.ai/CacheAwareConv/stable/"

@@ -72,5 +72,5 @@ end
     @test (@allocated ∇conv_data!(x̄, ȳ, w, p)) == 0
     @test (@allocated ∇conv_filter!(w̄, x, ȳ, p)) == 0
     p2 = plan_conv(x, w; pad = 1, gradients = true)
-    @test p2.grad[] !== nothing
+    @test p2.grad.state !== nothing
 end

@@ -92,6 +92,13 @@ low side when the total is odd, as in Lux and Flux).
 """
 struct SamePad end
 
+"""
+    calc_padding(pad, k, dilation, stride) -> NTuple{2S, Int}
+
+Expand a layer's `pad` argument (integer, per-dimension tuple, `(lo, hi)`
+tuple, or [`SamePad`](@ref)) to explicit `(lo_1, hi_1, …)` padding for
+kernel size `k`.
+"""
 function calc_padding(pad, k::NTuple{S, Int}, dilation::NTuple{S, Int}, stride::NTuple{S, Int}) where {S}
     return _expand_pad(Val(S), pad)
 end

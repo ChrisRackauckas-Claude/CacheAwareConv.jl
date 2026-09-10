@@ -39,6 +39,7 @@ CacheAwareConv.calc_padding
 ∇conv_data!
 ∇conv_filter!
 ∇conv_data
+∇conv_filter
 CacheAwareConv.bias_gradient!
 ```
 

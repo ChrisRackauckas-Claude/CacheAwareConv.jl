@@ -73,20 +73,21 @@ end
 
 function grad_state(p::PT) where {T, Tc, N, S, P, V, MR, NR, NP, PT <: ConvPlan{T, Tc, N, S, P, V, MR, NR, NP}}
     GT = grad_state_type(PT)
-    st = p.grad[]
+    st = p.grad.state
     st === nothing || return st::GT
     return Base.@lock p.lock begin
-        st2 = p.grad[]
+        st2 = p.grad.state
         if st2 === nothing
             g = p.geom
             gt = transposed_geometry(g)
             data_plan = ConvPlan(T, gt; nthreads = p.nthreads, cache = p.cache)::PT
             cout_g = channels_out(g) ÷ g.groups
-            ylen = p.Lpy * prod(ntuple(i -> p.tile[i + 1], Val(S - 1))) * cout_g * NP
+            _, ycostride = _ybuf_geometry(p)
+            ylen = ycostride * cout_g * NP + V     # slack for flat-mode reads past the end
             ybufs = [zeros(Tc, ylen) for _ in 1:p.nthreads]
             wpartials = [zeros(Tc, NP * prod(g.wsize)) for _ in 1:p.nthreads]
             st2 = GT(data_plan, ybufs, wpartials)
-            p.grad[] = st2
+            p.grad.state = st2
         end
         st2::GT
     end
@@ -140,35 +141,47 @@ function ∇conv_filter!(w̄::AbstractArray{T, N}, x::AbstractArray{T, N}, ȳ::A
 end
 
 """
-    ∇conv_data(ȳ, w, plan), ∇conv_filter(x, ȳ, plan)
+    ∇conv_data(ȳ, w, plan)
 
-Allocating versions of [`∇conv_data!`](@ref) and [`∇conv_filter!`](@ref).
+Allocating version of [`∇conv_data!`](@ref): the gradient of `conv(x, w)`
+with respect to `x`.
 """
 ∇conv_data(ȳ::AbstractArray{T, N}, w::AbstractArray{T, N}, p::ConvPlan{T, Tc, N}) where {T, Tc, N} =
     ∇conv_data!(similar(ȳ, T, input_size(p)), ȳ, w, p)
+
+"""
+    ∇conv_filter(x, ȳ, plan)
+
+Allocating version of [`∇conv_filter!`](@ref): the gradient of `conv(x, w)`
+with respect to `w`.
+"""
 ∇conv_filter(x::AbstractArray{T, N}, ȳ::AbstractArray{T, N}, p::ConvPlan{T, Tc, N}) where {T, Tc, N} =
     ∇conv_filter!(similar(x, T, kernel_size(p)), x, ȳ, p)
 
-"""
-    pack_output_tile!(Yp, ȳ, g, b, origin, te, tile, Lpy, cout_g, grp, ::Val{NP})
+# Column-major strides of an array with the given size.
+@inline function _dims_strides(dims::NTuple{N, Int}) where {N}
+    return ntuple(Val(N)) do i
+        s = 1
+        for j in 1:(i - 1)
+            s *= dims[j]
+        end
+        s
+    end
+end
 
-Pack the output-gradient tile for group `grp` into
-`Yp[Lpy, tile[2:end]..., cout_g, NP]`, zero beyond the valid width so that the
-lanes past the tile edge contribute nothing.
+"""
+    pack_output_tile!(Yp, ȳ, b, origin, te, rowstr, costride, cout_g, grp, ::Val{NP})
+
+Pack the output-gradient tile for group `grp` into the per-task buffer with
+row strides `rowstr` and channel stride `costride` (the geometry returned by
+`_ybuf_geometry`), zero everywhere outside the valid region so that lanes past
+the tile edge contribute nothing.
 """
 function pack_output_tile!(
-        Yp::Vector{Tc}, ȳ::AbstractArray{T, N}, g::ConvGeometry{N, S}, b::Int, origin::NTuple{S, Int},
-        te::NTuple{S, Int}, tile::NTuple{S, Int}, Lpy::Int, cout_g::Int, grp::Int, ::Val{NP}
+        Yp::Vector{Tc}, ȳ::AbstractArray{T, N}, b::Int, origin::NTuple{S, Int},
+        te::NTuple{S, Int}, rowstr, costride::Int, cout_g::Int, grp::Int, ::Val{NP}
     ) where {Tc, T, N, S, NP}
     rows = CartesianIndices(ntuple(i -> te[i + 1], Val(S - 1)))
-    rowstr = ntuple(Val(S - 1)) do i
-        st = Lpy
-        for j in 2:i
-            st *= tile[j]
-        end
-        st
-    end
-    costride = Lpy * prod(ntuple(i -> tile[i + 1], Val(S - 1)))
     planestride = costride * cout_g
     fill!(Yp, zero(Tc))
     @inbounds for co_l in 1:cout_g
@@ -208,19 +221,17 @@ function _filter_work_item!(
     nvec = cld(te[1], V)
     # Packed x geometry.
     xrowstr = _packed_rowstrides(p)                 # per output-row-dim stride (before × stride)
-    # Packed ȳ geometry: [Lpy, tile[2:end]..., cout_g, NP].
-    yrowstr = ntuple(Val(S - 1)) do i
-        s = p.Lpy
-        for j in 2:i
-            s *= p.tile[j]
-        end
-        s
-    end
-    y_costride = p.Lpy * prod(ntuple(i -> p.tile[i + 1], Val(S - 1)))
+    # Packed ȳ geometry (row mode: [Lpy, tile[2:end]...]; flat mode: packed-tile geometry).
+    yrowstr, y_costride = _ybuf_geometry(p)
     y_planestride = y_costride * cout_g
+    # Flat mode: the whole tile is one vector of length F.
+    flatlen = 1
+    for i in 1:S
+        flatlen += (te[i] - 1) * (i == 1 ? 1 : xrowstr[i - 1])
+    end
     # Partial gradient layout: natural w layout, NP planes.
     wlen = prod(g.wsize)
-    wstr = Base.size_to_strides(1, g.wsize...)
+    wstr = _dims_strides(g.wsize)
     kspatial = CartesianIndices(ntuple(i -> g.wsize[i], Val(S)))
     # Rows beyond the first row dimension are iterated outside the kernel.
     outer = CartesianIndices(ntuple(i -> te[i + 2], Val(max(S - 2, 0))))
@@ -231,8 +242,10 @@ function _filter_work_item!(
     sz = _sz(Tc)
     chunk = clamp(fld(p.cache.l1 ÷ 2 ÷ sz, NP * (MRc * p.Lp + NRc * p.Lpy)), 1, nrows)
     chunk = max(chunk, min(nrows, cld(32, max(nvec, 1))))
+    # Flat mode chunks the vector range instead of rows.
+    fchunk = max(V, (clamp(fld(p.cache.l1 ÷ 2 ÷ sz, NP * (MRc + NRc)), V, max(flatlen, V)) ÷ V) * V)
     for grp in 1:G
-        pack_output_tile!(Yp, ȳ, g, b, origin, te, p.tile, p.Lpy, cout_g, grp, Val(NP))
+        pack_output_tile!(Yp, ȳ, b, origin, te, yrowstr, y_costride, cout_g, grp, Val(NP))
         for cb in 1:ncb
             ci0 = (grp - 1) * cin_g + (cb - 1) * Kc
             kc = min(Kc, cin_g - (cb - 1) * Kc)
@@ -243,6 +256,28 @@ function _filter_work_item!(
                 for cot in 1:cld(cout_g, NRc)
                     co0 = (cot - 1) * NRc
                     nrc = min(NRc, cout_g - co0)
+                    if p.flat
+                        f0 = 0
+                        while f0 < flatlen
+                            nv = min(cld(flatlen - f0, V), fchunk ÷ V)
+                            for (t, k) in enumerate(kspatial)
+                                obase = 0
+                                for i in 1:S
+                                    obase += (k[i] - 1) * wstr[i]
+                                end
+                                obase += ((cb - 1) * Kc + ci_l0) * wstr[N - 1] + ((grp - 1) * cout_g + co0) * wstr[N]
+                                dispatch_filter_microkernel!(
+                                    Val(SIMD), Val(V), Val(MRc), Val(NRc), Val(NP), mrc, nrc,
+                                    out, obase, wstr[N - 1], wstr[N], wlen,
+                                    Xp, ci_l0 * p.xci_stride + f0 + p.taps[t], p.xci_stride, p.xplane_stride, 0,
+                                    Yp, co0 * y_costride + f0, y_costride, y_planestride, 0,
+                                    1, nv
+                                )
+                            end
+                            f0 += nv * V
+                        end
+                        continue
+                    end
                     for od in outer
                         xouter = 0
                         youter = 0

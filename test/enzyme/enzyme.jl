@@ -89,15 +89,35 @@ end
     @test ẏ3 ≈ conv_bias(ẋ, w, nothing, p) .+ conv_bias(x, ẇ, nothing, p)
 end
 
-@testset "Enzyme reverse: gradient functions are themselves differentiable" begin
-    # ∇conv_data is linear in ȳ; differentiate a loss of it w.r.t. ȳ.
+@testset "Enzyme: gradient functions are themselves differentiable" begin
+    # Both gradients are linear maps; their rules call other cache-aware convolutions.
     rng = MersenneTwister(33)
     x = randn(rng, 9, 9, 2, 1)
     w = randn(rng, 3, 3, 2, 2)
     p = plan_conv(x, w; pad = 1)
     ȳ = randn(rng, output_size(p))
-    f(ȳ) = sum(abs2, ∇conv_data(ȳ, w, p))
-    dȳ = Enzyme.gradient(Reverse, f, ȳ)[1]
+    g = geometry(p)
     # d/dȳ ‖Aᵀȳ‖² = 2 A Aᵀ ȳ, with A the forward conv
+    f(ȳ) = sum(abs2, ∇conv_data(ȳ, w, p))
+    dȳ = Enzyme.gradient(Reverse, Const(f), ȳ)[1]
     @test dȳ ≈ 2 .* conv(∇conv_data(ȳ, w, p), w, p)
+    # w.r.t. w: x̄ = Aᵀ(w) ȳ, d/dw ‖x̄‖² = 2 ∇conv_filter(x̄, ȳ)
+    h(w) = sum(abs2, ∇conv_data(ȳ, w, p))
+    dw = Enzyme.gradient(Reverse, Const(h), w)[1]
+    x̄ = ∇conv_data(ȳ, w, p)
+    dw_ref = similar(w)
+    reference_∇conv_filter!(dw_ref, x̄, ȳ, g)
+    @test dw ≈ 2 .* dw_ref
+    # ∇conv_filter: d/dx ‖corr(x, ȳ)‖² = 2 ∇conv_data(ȳ, w̄) ; d/dȳ = 2 conv(x, w̄)
+    k(x) = sum(abs2, ∇conv_filter(x, ȳ, p))
+    dx = Enzyme.gradient(Reverse, Const(k), x)[1]
+    w̄ = ∇conv_filter(x, ȳ, p)
+    @test dx ≈ 2 .* ∇conv_data(ȳ, w̄, p)
+    m(ȳ) = sum(abs2, ∇conv_filter(x, ȳ, p))
+    dȳ2 = Enzyme.gradient(Reverse, Const(m), ȳ)[1]
+    @test dȳ2 ≈ 2 .* conv(x, w̄, p)
+    # forward mode through ∇conv_data (linear in ȳ)
+    ẏ = randn(rng, size(ȳ))
+    ẋ̄ = Enzyme.autodiff(Forward, Const(ȳ -> ∇conv_data(ȳ, w, p)), Duplicated(ȳ, ẏ))[1]
+    @test ẋ̄ ≈ ∇conv_data(ẏ, w, p)
 end
