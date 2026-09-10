@@ -79,6 +79,36 @@ end
     @test CacheAwareConv.vector_width(p) == 1
 end
 
+@testset "single-channel stencil path (row-blocked kernel)" begin
+    rng = MersenneTwister(7)
+    small = CacheInfo(; l1 = 2048, l2 = 16384, l3 = 65536)
+    # 2D/3D, strides (phases), dilation, flip, asymmetric pad, tiny tiles, row tails, column tails
+    for (T, spatial, k, kw) in (
+            (Float64, (37, 11), (3, 3), (; pad = 1)),
+            (Float64, (40, 9), (5, 5), (; pad = 2, stride = (2, 1))),
+            (Float32, (70, 13), (3, 3), (; pad = (1, 0, 2, 1), dilation = (2, 1), flipped = true)),
+            (Float64, (33, 9, 5), (3, 3, 3), (; pad = 1)),
+            (Float64, (33, 9, 5), (3, 3, 2), (; pad = 1, stride = (1, 1, 2), dilation = (1, 2, 1))),
+            (Float64, (64, 17), (3, 3), (; pad = 1, cache = small)),
+            (Float64, (20, 7), (7, 7), (; pad = 3)),
+            (Float64, (130, 30), (3, 3), (; pad = 1)),
+            (Float64, (17, 4), (3, 3), (; pad = 1)),
+            (Float32, (129, 31), (9, 9), (; pad = 4)),
+        )
+        p = check_case(rng, T, spatial, k, 1, 1; kw...)
+        @test typeof(p).parameters[end] !== nothing      # stencil descriptor present
+    end
+    # row stride > 1 falls back to the general kernel and stays correct
+    p = check_case(rng, Float64, (30, 20), (3, 3), 1, 1; pad = 1, stride = (1, 2))
+    @test typeof(p).parameters[end] === nothing
+    # results independent of thread count
+    x = randn(rng, Float64, 200, 60, 1, 2)
+    w = randn(rng, Float64, 3, 3, 1, 1)
+    y1 = conv(x, w, plan_conv(x, w; pad = 1, nthreads = 1))
+    y8 = conv(x, w, plan_conv(x, w; pad = 1, nthreads = 8))
+    @test y1 == y8
+end
+
 @testset "negative padding (cropping)" begin
     rng = MersenneTwister(4)
     check_case(rng, Float64, (12, 10), (3, 3), 2, 2; pad = (-1, -2, 0, -1))

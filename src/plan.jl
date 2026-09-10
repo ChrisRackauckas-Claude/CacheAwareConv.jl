@@ -31,7 +31,7 @@ flattened-row traversal for narrow outputs on or off (default: automatic).
 
 See also [`plan_conv`](@ref), [`output_size`](@ref).
 """
-struct ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}
+struct ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST}
     geom::ConvGeometry{N, S, P}
     cache::CacheInfo
     Kc::Int                       # input channels per block (weight panel in L1)
@@ -50,6 +50,7 @@ struct ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}
     ybufs::Vector{Vector{Tc}}     # per-task output accumulation tiles (empty when direct)
     direct::Bool                  # kernel writes `y` directly
     flat::Bool                    # flattened-row mode for narrow outputs (see conv.jl)
+    stencil_bases::Vector{Int}    # row-blocked stencil path: per-group base offsets (empty otherwise)
     nthreads::Int
     grad::GradSlot                # lazily built gradient state (see grad.jl)
     lock::ReentrantLock
@@ -223,6 +224,49 @@ function use_flat_mode(g::ConvGeometry{N, S}, tile::NTuple{S, Int}, V::Int, MR::
     return flat_util > 1.15 * row_util
 end
 
+"""
+    stencil_taps(g, Tc, NP, SIMD, Lp, R) -> (taps, bases)
+
+For a single-channel convolution with unit row stride, the compile-time tap
+descriptor `(group, row offset, lane shift)` per tap and the runtime group base
+offsets used by the row-blocked stencil kernel; `(nothing, Int[])` when the
+path does not apply.
+"""
+function stencil_taps(g::ConvGeometry{N, S}, ::Type{Tc}, NP::Int, SIMD::Bool, Lp::Int, R::NTuple{S, Int}) where {N, S, Tc}
+    (SIMD && NP == 1 && S >= 2 && channels_in(g) == 1 && channels_out(g) == 1 && g.stride[2] == 1) || return nothing, Int[]
+    K = prod(ntuple(i -> g.wsize[i], Val(S)))
+    K <= MAX_STENCIL_TAPS || return nothing, Int[]
+    kspatial = CartesianIndices(ntuple(i -> g.wsize[i], Val(S)))
+    # groups: stride phase along dim 1 × taps along dims ≥ 3
+    rowstride = ntuple(Val(S)) do i
+        st = g.stride[1] * Lp
+        for j in 2:(i - 1)
+            st *= R[j]
+        end
+        i <= 2 ? 0 : st
+    end
+    groups = Dict{Int, Int}()
+    bases = Int[]
+    taps = Vector{NTuple{3, Int}}(undef, K)
+    for (t, k) in enumerate(kspatial)
+        off1 = (kernel_index(g, k[1], 1) - 1) * g.dilation[1]
+        ph = off1 % g.stride[1]
+        q = off1 ÷ g.stride[1]
+        r = (kernel_index(g, k[2], 2) - 1) * g.dilation[2]
+        base = ph * Lp
+        for i in 3:S
+            base += (kernel_index(g, k[i], i) - 1) * g.dilation[i] * rowstride[i]
+        end
+        gid = get!(groups, base) do
+            push!(bases, base)
+            length(bases)
+        end
+        taps[t] = (gid, r, q)
+    end
+    return Tuple(taps), bases
+end
+const MAX_STENCIL_TAPS = 169
+
 function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info(), flat::Union{Nothing, Bool} = nothing) where {T, N, S, P}
     T <: Number || throw(ArgumentError("element type must be a Number, got $T"))
     Tc = compute_type(T)
@@ -234,6 +278,10 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     Kc, Nc, tile = choose_blocking(g, Tc, NP, V, MR, NR, cache, nt)
     useflat = flat === nothing ? use_flat_mode(g, tile, V, MR) : (flat && S >= 2 && all(==(1), g.stride))
     Lp, W1, R = _packed_extents(g, tile, V, useflat)
+    stencil, sbases = stencil_taps(g, Tc, NP, SIMD, Lp, R)
+    if stencil !== nothing && (useflat || !(Tc === T))
+        stencil, sbases = nothing, Int[]     # stencil path needs the direct, row-wise layout
+    end
     xci_stride = prod(R)
     xplane_stride = xci_stride * Kc
     xbuf_len = xplane_stride * NP + (useflat ? V : 0)     # slack: flat mode reads past the last row
@@ -254,9 +302,9 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     # multiplied by zeros) but never written, so it must not hold NaNs.
     xbufs = [zeros(Tc, xbuf_len) for _ in 1:ntasks]
     ybufs = [Vector{Tc}(undef, ybuf_len) for _ in 1:(direct ? 0 : ntasks)]
-    return ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}(
+    return ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD, stencil}(
         g, cache, Kc, Nc, tile, map(cld, ntuple(i -> g.ysize[i], Val(S)), tile), Lp, W1, R,
-        xci_stride, xplane_stride, Lpy, taps, Wp, xbufs, ybufs, direct, useflat, ntasks, GradSlot(nothing), ReentrantLock()
+        xci_stride, xplane_stride, Lpy, taps, Wp, xbufs, ybufs, direct, useflat, sbases, ntasks, GradSlot(nothing), ReentrantLock()
     )
 end
 
@@ -309,12 +357,12 @@ vector_width(::ConvPlan{T, Tc, N, S, P, V}) where {T, Tc, N, S, P, V} = V
 register_tile(::ConvPlan{T, Tc, N, S, P, V, MR, NR}) where {T, Tc, N, S, P, V, MR, NR} = (MR, NR)
 nplanes(::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP}) where {T, Tc, N, S, P, V, MR, NR, NP} = NP
 
-function Base.show(io::IO, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD}
+function Base.show(io::IO, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST}) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST}
     g = p.geom
     print(io, "ConvPlan{", T, "}(", g.xsize, " ⋆ ", g.wsize, " → ", g.ysize)
     print(io, "; stride=", g.stride, ", pad=", g.pad, ", dilation=", g.dilation, ", groups=", g.groups, ", flipped=", g.flipped)
     print(io, ") [", SIMD ? "SIMD " : "scalar ", Tc, " V=", V, " MR=", MR, " NR=", NR, " NP=", NP)
-    print(io, " Kc=", p.Kc, " Nc=", p.Nc, " tile=", p.tile, p.flat ? " flat" : "", " tasks=", p.nthreads, "]")
+    print(io, " Kc=", p.Kc, " Nc=", p.Nc, " tile=", p.tile, p.flat ? " flat" : "", ST === nothing ? "" : " stencil", " tasks=", p.nthreads, "]")
     return nothing
 end
 

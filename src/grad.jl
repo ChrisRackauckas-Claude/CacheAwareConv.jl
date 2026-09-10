@@ -66,30 +66,28 @@ struct GradState{Tc, MRc, NRc, DP}
     wpartials::Vector{Vector{Tc}}     # per-task partial weight gradients (NP planes)
 end
 
-function grad_state_type(::Type{PT}) where {T, Tc, N, S, P, V, MR, NR, NP, PT <: ConvPlan{T, Tc, N, S, P, V, MR, NR, NP}}
-    MRc, NRc = filter_register_tile(Tc, NP)
-    return GradState{Tc, MRc, NRc, PT}
-end
-
-function grad_state(p::PT) where {T, Tc, N, S, P, V, MR, NR, NP, PT <: ConvPlan{T, Tc, N, S, P, V, MR, NR, NP}}
-    GT = grad_state_type(PT)
+# The transposed plan shares every type parameter with the parent except the
+# stencil descriptor, so the state's type is not known from the parent's type.
+# Callers extract the concretely typed fields they need (see ∇conv_filter!).
+function grad_state(p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP}) where {T, Tc, N, S, P, V, MR, NR, NP}
     st = p.grad.state
-    st === nothing || return st::GT
+    st === nothing || return st
     return Base.@lock p.lock begin
         st2 = p.grad.state
         if st2 === nothing
             g = p.geom
             gt = transposed_geometry(g)
-            data_plan = ConvPlan(T, gt; nthreads = p.nthreads, cache = p.cache)::PT
+            data_plan = ConvPlan(T, gt; nthreads = p.nthreads, cache = p.cache)
             cout_g = channels_out(g) ÷ g.groups
             _, ycostride = _ybuf_geometry(p)
             ylen = ycostride * cout_g * NP + V     # slack for flat-mode reads past the end
             ybufs = [zeros(Tc, ylen) for _ in 1:p.nthreads]
             wpartials = [zeros(Tc, NP * prod(g.wsize)) for _ in 1:p.nthreads]
-            st2 = GT(data_plan, ybufs, wpartials)
+            MRc, NRc = filter_register_tile(Tc, NP)
+            st2 = GradState{Tc, MRc, NRc, typeof(data_plan)}(data_plan, ybufs, wpartials)
             p.grad.state = st2
         end
-        st2::GT
+        st2
     end
 end
 
@@ -105,7 +103,13 @@ function ∇conv_data!(x̄::AbstractArray{T, N}, ȳ::AbstractArray{T, N}, w::Abs
     _check_strided(x̄, "x̄")
     _check_strided(ȳ, "ȳ")
     st = grad_state(p)
-    pt = st.data_plan
+    _∇conv_data_impl!(x̄, ȳ, w, p, st.data_plan, accumulate)
+    return x̄
+end
+
+# Function barrier: the transposed plan's stencil type parameter is not
+# known statically from the parent plan's type.
+function _∇conv_data_impl!(x̄, ȳ, w, p::ConvPlan, pt::ConvPlan, accumulate::Bool)
     @assert output_size(pt) == size(x̄) && input_size(pt)[end - 1] == size(ȳ)[end - 1]
     iv = InputView(ȳ, p.geom.stride)
     _conv_impl!(x̄, iv, TransposedWeights(w, p.geom), pt, nothing, identity, true, accumulate)
@@ -124,19 +128,31 @@ function ∇conv_filter!(w̄::AbstractArray{T, N}, x::AbstractArray{T, N}, ȳ::A
     _check_strided(x, "x")
     _check_strided(ȳ, "ȳ")
     st = grad_state(p)
+    # One dynamic dispatch (the state's type is not known statically); the
+    # implementation below is fully typed.
+    _∇conv_filter_impl!(w̄, x, ȳ, p, st, accumulate)
+    return w̄
+end
+
+function _∇conv_filter_impl!(
+        w̄::AbstractArray{T, N}, x::AbstractArray{T, N}, ȳ::AbstractArray{T, N},
+        p::ConvPlan{T, Tc, N}, st::GradState{Tc, MRc, NRc}, accumulate::Bool
+    ) where {T, Tc, N, MRc, NRc}
     S = N - 2
     iv = InputView(x, ntuple(_ -> 1, Val(S)))
     nitems = batch_size(p.geom) * prod(p.nblocks)
     ntasks = max(1, min(p.nthreads, nitems))
+    ybufs = st.ybufs
+    wpartials = st.wpartials
     for t in 1:ntasks
-        fill!(st.wpartials[t], zero(Tc))
+        fill!(wpartials[t], zero(Tc))
     end
     run_tasks(nitems, p.nthreads) do task, items
         for item in items
-            _filter_work_item!(st, iv, ȳ, p, task, item)
+            _filter_work_item!(ybufs, wpartials, Val(MRc), Val(NRc), iv, ȳ, p, task, item)
         end
     end
-    _reduce_partials!(w̄, st.wpartials, ntasks, p, accumulate)
+    _reduce_partials!(w̄, wpartials, ntasks, p, accumulate)
     return w̄
 end
 
@@ -202,7 +218,7 @@ function pack_output_tile!(
 end
 
 function _filter_work_item!(
-        st::GradState{Tc, MRc, NRc}, iv::InputView, ȳ::AbstractArray{T, N},
+        ybufs::Vector{Vector{Tc}}, wpartials::Vector{Vector{Tc}}, ::Val{MRc}, ::Val{NRc}, iv::InputView, ȳ::AbstractArray{T, N},
         p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}, task::Int, item::Int
     ) where {Tc, MRc, NRc, T, N, S, P, V, MR, NR, NP, SIMD}
     g = p.geom
@@ -216,8 +232,8 @@ function _filter_work_item!(
     O = ntuple(i -> g.ysize[i], Val(S))
     te = ntuple(i -> min(p.tile[i], O[i] - origin[i]), Val(S))
     Xp = p.xbufs[task]
-    Yp = st.ybufs[task]
-    out = st.wpartials[task]
+    Yp = ybufs[task]
+    out = wpartials[task]
     nvec = cld(te[1], V)
     # Packed x geometry.
     xrowstr = _packed_rowstrides(p)                 # per output-row-dim stride (before × stride)

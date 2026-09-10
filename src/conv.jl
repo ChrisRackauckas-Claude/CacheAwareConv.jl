@@ -140,9 +140,9 @@ function _conv_impl!(
 end
 
 function _work_item!(
-        y::AbstractArray{T, N}, iv::InputView, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD},
+        y::AbstractArray{T, N}, iv::InputView, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST},
         bias, σ::F, accumulate::Bool, task::Int, item::Int
-    ) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD, F}
+    ) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST, F}
     g = p.geom
     G = g.groups
     cin_g = channels_in(g) ÷ G
@@ -190,6 +190,10 @@ function _work_item!(
                         )
                         continue
                     end
+                    if ST !== nothing
+                        _stencil_tile!(y, Xp, p, b, origin, te, ystr, rowstr, acc, wbase, K)
+                        continue
+                    end
                     for r in rows
                         xrow = 0
                         for i in 1:(S - 1)
@@ -226,6 +230,52 @@ function _work_item!(
             end
         else
             _finalize_buffered!(y, Yb, p, b, origin, te, grp, cout_g, yb_rowstr, yb_costride, yb_planestride, bias, σ, accumulate)
+        end
+    end
+    return nothing
+end
+
+"""
+    _stencil_tile!(y, Xp, p, b, origin, te, ystr, rowstr, acc, wbase, K)
+
+Row-blocked single-channel path: `MRH` output rows × all full `MRW*V` tiles
+per kernel call, remaining rows with a shorter row block, remaining columns
+with the general kernel.
+"""
+function _stencil_tile!(
+        y::AbstractArray{T, N}, Xp::Vector{Tc}, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST}, b::Int, origin, te, ystr, rowstr,
+        acc::Bool, wbase::Int, K::Int
+    ) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST}
+    MRW, MRH = stencil_tile(Tc)
+    x_row_stride = rowstr[1]
+    outer = CartesianIndices(ntuple(i -> te[i + 2], Val(S - 2)))
+    tilew = MRW * V
+    full = te[1] ÷ tilew
+    wo_tail = full * tilew
+    @inbounds for od in outer
+        xouter = 0
+        youter = origin[1] * ystr[1] + (b - 1) * ystr[N]
+        for i in 1:(S - 2)
+            xouter += (od[i] - 1) * p.geom.stride[i + 2] * rowstr[i + 1]
+            youter += (origin[i + 2] + od[i] - 1) * ystr[i + 2]
+        end
+        r0 = 0
+        while r0 < te[2]
+            mrh = min(MRH, te[2] - r0)
+            ybase = youter + (origin[2] + r0) * ystr[2]
+            xbase = xouter + r0 * x_row_stride
+            if full > 0
+                dispatch_rows!(Val(V), Val(MRW), Val(MRH), Val(ST), acc, mrh, y, ybase, ystr[2], Xp, xbase, x_row_stride, p.Wp, wbase, p.stencil_bases, full)
+            end
+            if wo_tail < te[1]
+                for r in 0:(mrh - 1)
+                    _tile_row!(
+                        Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, 1, te[1] - wo_tail,
+                        y, ybase + r * ystr[2] + wo_tail, ystr[N - 1], 0, Xp, xbase + r * x_row_stride + wo_tail, p, wbase, K, 1
+                    )
+                end
+            end
+            r0 += mrh
         end
     end
     return nothing

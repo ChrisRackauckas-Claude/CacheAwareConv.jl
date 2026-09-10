@@ -307,3 +307,117 @@ Mask with the first `n` lanes true.
 @inline function lane_mask(::Val{V}, n::Int) where {V}
     return Vec{V, Int32}(ntuple(i -> Int32(i - 1), Val(V))) < Vec{V, Int32}(Int32(n))
 end
+
+# ---------------------------------------------------------------------------
+# Row-blocked stencil kernel: a tile of `MRH` output rows × `MRW` vectors for a
+# single input and output channel and one plane. `TAPS[t] = (g_t, r_t, q_t)`:
+# tap group (stride phase × taps along dims ≥ 3, whose base offsets `bases[g]`
+# are runtime values), row offset in packed rows along dim 2, and lane shift
+# along dim 1, the last two compile-time. Within a group, an input row is
+# loaded once per shift and feeds every output row that overlaps it (unit row
+# stride), dividing the loads per FMA by roughly the kernel height; on
+# double-pumped AVX-512 cores this is what lifts the single-channel kernel
+# from ~55% to ~95% of the FMA peak.
+@generated function conv_microkernel_rows!(
+        ::Type{Vec{V, Tc}}, ::Val{MRW}, ::Val{MRH}, ::Val{TAPS}, ::Val{ACC},
+        yptr::Ptr{Tc}, y_row_stride::Int, xptr::Ptr{Tc}, x_row_stride::Int,
+        wptr::Ptr{Tc}, bases::Ptr{Int}, nrep::Int
+    ) where {V, Tc, MRW, MRH, TAPS, ACC}
+    VT = Vec{V, Tc}
+    sz = sizeof(Tc)
+    K = length(TAPS)
+    ngroups = maximum(t[1] for t in TAPS)
+    acc(j, i) = Symbol("acc_", j, "_", i)
+    wl = [:($(Symbol("w_", t)) = $VT(unsafe_load(wptr, $t))) for t in 1:K]
+    bl = [:($(Symbol("b_", g)) = unsafe_load(bases, $g) * $sz) for g in 1:ngroups]
+    init = Expr[]
+    for j in 0:(MRH - 1), i in 1:MRW
+        off = :(yr + $(j) * y_row_stride * $sz + $((i - 1) * V * sz))
+        push!(init, ACC ? :($(acc(j, i)) = vload($VT, $off)) : :($(acc(j, i)) = zero($VT)))
+    end
+    body = Expr[]
+    for g in 1:ngroups
+        gt = [(t, r, q) for (t, (gg, r, q)) in enumerate(TAPS) if gg == g]
+        isempty(gt) && continue
+        rmax = maximum(x[2] for x in gt)
+        for ρ in 0:(MRH - 1 + rmax)                   # input row relative to output row 0
+            shifts = unique(q for (t, r, q) in gt if 0 <= ρ - r < MRH)
+            isempty(shifts) && continue
+            push!(body, :(xrow_ptr = xr + $(Symbol("b_", g)) + $(ρ) * x_row_stride * $sz))
+            for q in shifts
+                for i in 1:MRW
+                    push!(body, :($(Symbol("x_", i)) = vload($VT, xrow_ptr + $((q + (i - 1) * V) * sz))))
+                end
+                for (t, r, qt) in gt
+                    qt == q || continue
+                    j = ρ - r
+                    0 <= j < MRH || continue
+                    for i in 1:MRW
+                        push!(body, :($(acc(j, i)) = muladd($(Symbol("x_", i)), $(Symbol("w_", t)), $(acc(j, i)))))
+                    end
+                end
+            end
+        end
+    end
+    stores = Expr[]
+    for j in 0:(MRH - 1), i in 1:MRW
+        push!(stores, :(vstore($(acc(j, i)), yr + $(j) * y_row_stride * $sz + $((i - 1) * V * sz))))
+    end
+    return quote
+        $(wl...)
+        $(bl...)
+        @inbounds for rep in 0:(nrep - 1)
+            yr = yptr + rep * $(MRW * V * sz)
+            xr = xptr + rep * $(MRW * V * sz)
+            $(init...)
+            $(body...)
+            $(stores...)
+        end
+        return nothing
+    end
+end
+
+"""
+    stencil_tile(Tc) -> (MRW, MRH)
+
+Register tile (vectors along the width × output rows) of the row-blocked
+stencil kernel.
+"""
+function stencil_tile(::Type{Tc}) where {Tc}
+    rc = Int(known(register_count()))::Int
+    rc >= 32 && return (2, 4)
+    rc >= 16 && return (2, 2)
+    return (1, 2)
+end
+
+@generated function dispatch_rows!(
+        ::Val{V}, ::Val{MRW}, ::Val{MRH}, ::Val{TAPS}, acc::Bool, mrh::Int,
+        y::AbstractArray{Tc}, ybase::Int, y_row_stride::Int, Xp::Vector{Tc}, xbase::Int, x_row_stride::Int,
+        Wp::Vector{Tc}, wbase::Int, bases::Vector{Int}, nrep::Int
+    ) where {Tc, V, MRW, MRH, TAPS}
+    ex = :(error("unreachable"))
+    for h in MRH:-1:1
+        ex = :(
+            if mrh == $h
+                if acc
+                    conv_microkernel_rows!(Vec{$V, Tc}, Val($MRW), Val($h), Val($TAPS), Val(true), yptr, y_row_stride, xptr, x_row_stride, wptr, bptr, nrep)
+                else
+                    conv_microkernel_rows!(Vec{$V, Tc}, Val($MRW), Val($h), Val($TAPS), Val(false), yptr, y_row_stride, xptr, x_row_stride, wptr, bptr, nrep)
+                end
+            else
+                $ex
+            end
+        )
+    end
+    return quote
+        sz = sizeof(Tc)
+        yptr = pointer(y) + ybase * sz
+        xptr = pointer(Xp) + xbase * sz
+        wptr = pointer(Wp) + wbase * sz
+        bptr = pointer(bases)
+        GC.@preserve y Xp Wp bases begin
+            $ex
+        end
+        return nothing
+    end
+end

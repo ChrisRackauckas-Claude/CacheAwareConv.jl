@@ -67,6 +67,23 @@ the plan summary; `flat = true/false` forces it). The weight-gradient kernel
 uses the same trick, with the packed output-gradient tile zero everywhere
 outside the valid region.
 
+## Single-channel stencils
+
+With one input and one output channel the `MR × NR` tile degenerates (`NR = 1`)
+and every fused multiply-add needs its own input vector load, which is the
+binding constraint on AVX-512 cores that double-pump 512-bit loads. For
+`C_in = C_out = 1` with unit row stride, the plan therefore switches to a
+row-blocked kernel: `MRH` output rows × `MRW` vectors per register tile, with
+the `K` weights held in registers. Taps are grouped by their runtime base
+(stride phase along the width, taps along the third and higher spatial
+dimensions) and, within a group, described by compile-time (row offset, lane
+shift) pairs that become a type parameter of the plan. Each input row of a
+group is loaded once per lane shift and feeds every output row that overlaps
+it, dividing loads per FMA by roughly the kernel height. Partial row blocks
+and the column tail fall back to the general kernel. The gradient with
+respect to the input is a stencil too and takes the same path through the
+transposed plan.
+
 ## Choosing the blocks from the cache sizes
 
 With `sz` the size of a packed element and `K = ∏ kernel size`:

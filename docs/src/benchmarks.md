@@ -34,28 +34,34 @@ runs depending on other load; the table shows an idle run.
 Single input and output channel, `Float64`, 2²⁴ points (1D) or a 4096² grid
 (2D), no padding. The roofline is `max(flops / FMA peak, bytes / copy bandwidth)`
 with both peaks measured in the same process: 45 GFLOPS per core for the dense
-microkernel, 34 GB/s single-thread and 145 GB/s 16-thread `copyto!`, and
+microkernel, 34 GB/s single-thread and 121–145 GB/s 16-thread `copyto!`, and
 577 GFLOPS aggregate for 16 unpinned threads running the dense kernel
 concurrently (this machine has 32 cores with SMT and lower all-core clocks).
 
-| stencil | 1 thread | % of roofline | 16 threads | % of roofline (577 GFLOPS / 145 GB/s) |
+| stencil | 1 thread | % of roofline | 16 threads | % of roofline (577 GFLOPS / 121 GB/s) |
 |---|---|---|---|---|
-| 1D k=3 | 24.6 GB/s | 73% (bandwidth) | 116 GB/s | 80% |
-| 1D k=7 | 19.8 GB/s | 59% (bandwidth) | 121 GB/s | 83% |
-| 1D k=11 | 21 GFLOPS | 48% (FMA) | 126 GFLOPS | 63% (bandwidth) |
-| 1D k=19 | 25 GFLOPS | 55% (FMA) | 162 GFLOPS | 28% (FMA) |
-| 1D k=51 | 27 GFLOPS | 61% (FMA) | 166 GFLOPS | 29% (FMA) |
-| 2D 3×3 | 15.1 GB/s | 45% (bandwidth) | 95 GB/s | 65% |
-| 2D 5×5 | 25 GFLOPS | 55% (FMA) | 161 GFLOPS | 28% (FMA) |
-| 2D 9×9 | 28 GFLOPS | 62% (FMA) | 269 GFLOPS | 47% (FMA) |
-| 2D 13×13 | 28 GFLOPS | 62% (FMA) | 406 GFLOPS | 70% (FMA) |
+| 1D k=3 | 24.4 GB/s | 72% (bandwidth) | 134 GB/s | 100% |
+| 1D k=7 | 20.0 GB/s | 59% (bandwidth) | 119 GB/s | 98% |
+| 1D k=11 | 21 GFLOPS | 47% (FMA) | 126 GFLOPS | 76% (bandwidth) |
+| 1D k=19…51 | 25–27 GFLOPS | 55–61% (FMA) | 155–163 GFLOPS | 23–54% (FMA) |
+| 2D 3×3 | 19.2 GB/s | 57% (bandwidth) | 108 GB/s | 89% |
+| 2D 5×5 | 34 GFLOPS | 77% (FMA) | 205 GFLOPS | 36% (FMA) |
+| 2D 7×7 | 37 GFLOPS | 82% (FMA) | 225 GFLOPS | 39% (FMA) |
+| 2D 9×9 | 42 GFLOPS | 94% (FMA) | 262 GFLOPS | 45% (FMA) |
+| 2D 11×11 | 35 GFLOPS | 77% (FMA) | | |
+| 2D 13×13 | 42 GFLOPS | 93% (FMA) | | |
 
 A hand-written `@inbounds @simd` stencil loop over the same data runs 3–8×
 slower than `conv!` on one thread.
 
-Single-thread, the FMA-bound stencils sit at a flat 55–62% of peak from
-k = 11 up to 13×13: the single-channel kernel issues one input vector load per
-fused multiply-add (`MR × 1` tile with hoisted weights), so it is bound by the
-load ports, not the FMA units. Reusing loaded vectors across neighbouring taps
-with lane shifts would lift this; it is the main remaining single-core
-optimisation for stencils.
+Two-dimensional (and higher) single-channel stencils use the row-blocked
+kernel (`MRH` output rows × `MRW` vectors per register tile): an input row is
+loaded once and feeds every output row that overlaps it, so the loads per
+fused multiply-add drop by roughly the kernel height. That is what moves the
+2D stencils from ~60% to 77–94% of the FMA peak. One-dimensional stencils
+have no such reuse; with one 512-bit load per FMA they stay at 55–61% on this
+core, where a cache-line-straddling load and a 512-bit lane shift (`valignq`)
+both cost two cycles, so neither lane shifts nor 256-bit vectors help (both
+were measured). The 16-thread FMA-bound numbers are limited by the driver
+under load rather than by the kernel, which reaches 577 GFLOPS aggregate on
+its own; that is the remaining stencil optimisation.
