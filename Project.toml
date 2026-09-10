@@ -35,3 +35,23 @@ SIMD = "3.7"
 SciMLPublic = "1"
 Static = "1"
 julia = "1.10"
+FiniteDifferences = "0.12"
+NNlib = "0.9"
+Random = "1.10"
+SafeTestsets = "0.1, 1"
+SciMLTesting = "2.13"
+Test = "1.10"
+Zygote = "0.7"
+
+[extras]
+ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+FiniteDifferences = "26cc04aa-876d-5657-8c51-4c34ba976000"
+NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SafeTestsets = "1bc83da4-3b8d-516f-aca4-4fe02f6d838f"
+SciMLTesting = "09d9d899-5365-40a9-917a-5f67fddea283"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[targets]
+test = ["ChainRulesCore", "FiniteDifferences", "NNlib", "Random", "SafeTestsets", "SciMLTesting", "Test", "Zygote"]

@@ -1,0 +1,4 @@
+[default.extend-words]
+# Convolution vocabulary and identifiers
+ba = "ba"
+nd = "nd"

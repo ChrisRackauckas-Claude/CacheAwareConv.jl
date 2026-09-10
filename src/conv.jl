@@ -9,6 +9,11 @@ Compute `y = σ.(conv(x, w) .+ bias)` in place using the pre-planned blocking.
 `accumulate = true` the result is added to the existing contents of `y`
 instead (`y .+= conv(x, w) .+ bias`; `σ` must then be `identity`). All three
 arrays must have the plan's element type and sizes. Returns `y`.
+
+The activation `σ` is fused into the tile epilogue while the output tile is
+still in cache. This fused path has no automatic-differentiation rules: for
+training, use `σ = identity` (or [`conv_bias`](@ref)) and apply the activation
+as a separate broadcast, which is what the Lux and Flux layers do.
 """
 function conv!(
         y::AbstractArray{T, N}, x::AbstractArray{T, N}, w::AbstractArray{T, N}, p::ConvPlan{T, Tc, N};
@@ -19,6 +24,10 @@ function conv!(
     _check_strided(y, "y")
     _check_strided(x, "x")
     accumulate && σ !== identity && throw(ArgumentError("accumulate = true requires σ = identity"))
+    if σ === identity
+        # Positional core: this is what the AD rules attach to.
+        return conv_core!(y, x, w, bias, p, accumulate)
+    end
     S = N - 2
     iv = InputView(x, ntuple(_ -> 1, Val(S)))
     _conv_impl!(y, iv, w, p, bias, σ, false, accumulate)

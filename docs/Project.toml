@@ -1,0 +1,7 @@
+[deps]
+CacheAwareConv = "ae0c0968-3b55-4cf5-aa46-61dd257e9e80"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+
+[compat]
+CacheAwareConv = "0.1"
+Documenter = "1"

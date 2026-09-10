@@ -1,0 +1,23 @@
+[Core]
+versions = ["lts", "1", "pre"]
+os = ["ubuntu-latest", "macos-latest", "windows-latest"]
+num_threads = 4
+
+["Core 32-bit"]
+group = "Core"
+versions = ["1"]
+os = ["ubuntu-latest"]
+arch = "x86"
+
+[Enzyme]
+versions = ["1"]
+timeout = 180
+in_all = false
+
+[Layers]
+versions = ["1"]
+timeout = 180
+in_all = false
+
+[QA]
+versions = ["lts", "1"]
