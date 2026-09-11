@@ -7,24 +7,25 @@ im2col + BLAS path (which uses all threads through the BLAS). Scripts are in
 
 | shape | ours, 1 thread | ours, 16 threads | NNlib | speedup (16 vs NNlib) |
 |---|---|---|---|---|
-| 56×56, 64→64, 3×3, batch 8 | 83 GFLOPS | 950 GFLOPS | 121 GFLOPS | 7.9× |
-| 224×224, 3→64, 7×7, stride 2, batch 8 | 94 | 515 | 153 | 3.4× |
-| 28×28, 128→128, 3×3, batch 16 | 84 | 1088 | 316 | 3.4× |
-| 7×7, 512→512, 3×3, batch 16 (flat-row mode) | 72 | 665 | 379 | 1.8× |
-| 1D 65536, 16→32, k=9, batch 4 | 86 | 497 | 115 | 4.3× |
-| 3D 32³, 8→16, k=3, batch 2 | 86 | 488 | 37 | 13× |
-| 4096² image, 1→1, 3×3 (memory bound) | 13 | 151 | 2.2 | 69× |
-| Float64 56×56, 64→64, 3×3, batch 8 | 48 | 538 | 101 | 5.3× |
-| ComplexF32 56×56, 16→16, 3×3, batch 4 | 17 (real-FLOP equiv.) | 96 | 19 | 5.1× |
+| 56×56, 64→64, 3×3, batch 8 | 85 GFLOPS | 958 GFLOPS | 122 GFLOPS | 7.8× |
+| 224×224, 3→64, 7×7, stride 2, batch 8 | 94 | 361 | 161 | 2.2× |
+| 28×28, 128→128, 3×3, batch 16 | 85 | 1121 | 399 | 2.8× |
+| 7×7, 512→512, 3×3, batch 16 | 72 | 660 | 382 | 1.7× |
+| 1D 65536, 16→32, k=9, batch 4 | 98 | 569 | 98 | 5.8× |
+| 3D 32³, 8→16, k=3, batch 2 | 89 | 503 | 39 | 13× |
+| 4096² image, 1→1, 3×3 (stencil, memory bound) | 48 | 274 | 2.1 | 129× |
+| Float64 56×56, 64→64, 3×3, batch 8 | 49 | 554 | 99 | 5.6× |
+| ComplexF32 56×56, 16→16, 3×3, batch 4 | 18 (real-FLOP equiv.) | 101 | 17 | 5.9× |
 
 Single-core throughput is roughly 80% of the core's FMA peak for
 compute-bound shapes. The microkernel alone reaches about 88%; the rest is
 packing and partial tiles. The memory-bound image filter runs at streaming
 bandwidth once enough threads are used: `benchmark/streaming.jl` on a
-16384² `Float32` image (2 GB in + out) reaches 54 GB/s with 16 threads
-against 36 GB/s for a single-threaded `copyto!` of the same data; one thread
-alone is limited to 4 GB/s by the per-tap kernel-call overhead of the
-single-channel case.
+16384² `Float32` image (2 GB in + out) reaches 148 GB/s with 16 threads
+(120 GB/s for `Float64`, 4 GB) against 28–37 GB/s for a single-threaded
+`copyto!` of the same data. One thread reaches 7 GB/s on this image (the plan
+picks a 16384×5 tile), against 19 GB/s on a 4096² grid (see below); the gap
+has not been investigated.
 
 Multi-threaded numbers on this shared machine varied by up to 1.8× between
 runs depending on other load; the table shows an idle run.
