@@ -19,5 +19,9 @@ versions = ["1"]
 timeout = 180
 in_all = false
 
+[Extensions]
+versions = ["1"]
+in_all = false
+
 [QA]
 versions = ["lts", "1"]

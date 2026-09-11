@@ -127,12 +127,12 @@ rewriting them from a single core is dominated by coherence traffic.
 """
 function pack_weights!(
         Wp::Vector{Tc}, w::AbstractArray{<:Number, N}, g::ConvGeometry{N, S},
-        Kc::Int, NR::Int, ::Val{NP}, conjugate::Bool; ntasks::Int = 1
+        Kc::Int, NR::Int, ::Val{NP}, conjugate::Bool; ntasks::Int = 1, exec::ConvExecutor = ExecSpawn
     ) where {Tc, N, S, NP}
     G = g.groups
     cout_g = channels_out(g) ÷ G
     ntiles = cld(cout_g, NR)
-    run_tasks(G * ntiles, ntasks) do _, items
+    run_tasks(G * ntiles, ntasks, exec) do _, items
         for item in items
             grp, ct = fldmod1(item, ntiles)
             _pack_weight_tile!(Wp, w, g, Kc, NR, Val(NP), conjugate, grp, ct)
