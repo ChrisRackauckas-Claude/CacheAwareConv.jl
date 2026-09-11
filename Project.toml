@@ -1,6 +1,6 @@
 name = "CacheAwareConv"
 uuid = "ae0c0968-3b55-4cf5-aa46-61dd257e9e80"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Oscar Smith <oscar.smith@juliahub.com> and contributors"]
 
 [deps]
