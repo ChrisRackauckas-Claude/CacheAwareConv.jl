@@ -41,7 +41,7 @@ export reference_conv!, reference_∇conv_data!, reference_∇conv_filter!
 @public output_size, input_size, kernel_size, channels_in, channels_out, batch_size, groups, flipped, stride, padding, dilation, spatial_dims
 @public cache_info, compute_type, vector_width, register_tile, nplanes, allocated_bytes, geometry
 @public conv_core!, conv_bias, bias_gradient!, PlanCache, get_plan!, SamePad, calc_padding
-@public ConvKernel, ConvExecutor, KernelAuto, KernelSIMD, KernelScalar, KernelLV, ExecSpawn, ExecPolyester
+@public ConvKernel, ConvExecutor
 export LuxConv, FluxConv
 
 end
