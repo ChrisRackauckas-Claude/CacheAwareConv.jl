@@ -127,7 +127,7 @@ rewriting them from a single core is dominated by coherence traffic.
 """
 function pack_weights!(
         Wp::Vector{Tc}, w::AbstractArray{<:Number, N}, g::ConvGeometry{N, S},
-        Kc::Int, NR::Int, ::Val{NP}, conjugate::Bool; ntasks::Int = 1, exec::Symbol = :spawn
+        Kc::Int, NR::Int, ::Val{NP}, conjugate::Bool; ntasks::Int = 1, exec::ConvExecutor = ExecSpawn
     ) where {Tc, N, S, NP}
     G = g.groups
     cout_g = channels_out(g) ÷ G

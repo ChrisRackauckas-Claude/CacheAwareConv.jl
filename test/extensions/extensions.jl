@@ -14,7 +14,7 @@ function check_kernel(rng, T, spatial, k, cin, cout; kernel, kwargs...)
     x = randarr(rng, T, (spatial..., cin, 2))
     w = randarr(rng, T, (k..., cin ÷ get(kwargs, :groups, 1), cout))
     p = ConvPlan(T, size(x), size(w); kwargs..., kernel)
-    @test p.kernel === kernel
+    @test p.kernel === CacheAwareConv._kernel_enum(kernel)
     y = conv(x, w, p)
     yr = similar(y)
     reference_conv!(yr, x, w, geometry(p))
@@ -79,7 +79,7 @@ end
     w = randn(rng, Float32, 3, 3, 6, 10)
     ps = plan_conv(x, w; pad = 1, nthreads = 4)
     pp = plan_conv(x, w; pad = 1, nthreads = 4, executor = :polyester)
-    @test pp.executor === :polyester
+    @test pp.executor === CacheAwareConv.ExecPolyester
     @test conv(x, w, pp) == conv(x, w, ps)
     ȳ = randn(rng, Float32, output_size(ps))
     @test ∇conv_data(ȳ, w, pp) == ∇conv_data(ȳ, w, ps)
@@ -95,9 +95,14 @@ end
     @test_throws ArgumentError plan_conv(x, w; kernel = :bogus)
     @test_throws ArgumentError plan_conv(x, w; kernel = :turbo)
     @test_throws ArgumentError plan_conv(x, w; executor = :bogus)
+    @test_throws ArgumentError plan_conv(x, w; executor = 42)
+    # enum values are accepted equivalently to the Symbols
+    pe = plan_conv(x, w; kernel = CacheAwareConv.KernelLV, executor = CacheAwareConv.ExecPolyester)
+    @test pe.kernel === CacheAwareConv.KernelLV
+    @test pe.executor === CacheAwareConv.ExecPolyester
     xb = randn(BigFloat, 9, 2, 1)
     wb = randn(BigFloat, 3, 2, 4)
     @test_throws ArgumentError plan_conv(xb, wb; kernel = :lv)
     @test_throws ArgumentError plan_conv(xb, wb; kernel = :simd)
-    @test plan_conv(xb, wb).kernel === :scalar
+    @test plan_conv(xb, wb).kernel === CacheAwareConv.KernelScalar
 end

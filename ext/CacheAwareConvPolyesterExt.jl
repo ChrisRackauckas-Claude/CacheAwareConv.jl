@@ -3,15 +3,13 @@ module CacheAwareConvPolyesterExt
 using CacheAwareConv
 using Polyester: @batch
 
-# Same contiguous-chunk contract as `run_tasks`: iteration `t` owns scratch
-# buffer `t`, so batching over the task index keeps buffer exclusivity and the
-# deterministic reduction order.
+# Parallelise over the work items themselves and let Polyester do the
+# partitioning: the scratch-buffer index is the executing thread's id, so
+# plans allocate `Threads.nthreads()` buffers under this executor (see
+# `nscratch`). `minbatch` bounds the number of participating threads by `nt`.
 function CacheAwareConv.run_tasks_polyester(f::F, nitems::Int, nt::Int) where {F}
-    chunk = cld(nitems, nt)
-    @batch for t in 1:nt
-        lo = (t - 1) * chunk + 1
-        hi = min(nitems, t * chunk)
-        lo <= hi && f(t, lo:hi)
+    @batch minbatch = cld(nitems, nt) for item in 1:nitems
+        f(Threads.threadid(), item:item)
     end
     return nothing
 end

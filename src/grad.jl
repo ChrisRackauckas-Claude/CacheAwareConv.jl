@@ -81,8 +81,9 @@ function grad_state(p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP}) where {T, Tc, N,
             cout_g = channels_out(g) ÷ g.groups
             _, ycostride = _ybuf_geometry(p)
             ylen = ycostride * cout_g * NP + V     # slack for flat-mode reads past the end
-            ybufs = [zeros(Tc, ylen) for _ in 1:p.nthreads]
-            wpartials = [zeros(Tc, NP * prod(g.wsize)) for _ in 1:p.nthreads]
+            nbuf = nscratch(p.executor, p.nthreads)
+            ybufs = [zeros(Tc, ylen) for _ in 1:nbuf]
+            wpartials = [zeros(Tc, NP * prod(g.wsize)) for _ in 1:nbuf]
             MRc, NRc = filter_register_tile(Tc, NP)
             st2 = GradState{Tc, MRc, NRc, typeof(data_plan)}(data_plan, ybufs, wpartials)
             p.grad.state = st2
@@ -141,10 +142,11 @@ function _∇conv_filter_impl!(
     S = N - 2
     iv = InputView(x, ntuple(_ -> 1, Val(S)))
     nitems = batch_size(p.geom) * prod(p.nblocks)
-    ntasks = max(1, min(p.nthreads, nitems))
     ybufs = st.ybufs
     wpartials = st.wpartials
-    for t in 1:ntasks
+    # Under ExecPolyester `task` is a thread id, not a dense index, so the
+    # whole buffer set participates in the fill and the reduction.
+    for t in eachindex(wpartials)
         fill!(wpartials[t], zero(Tc))
     end
     run_tasks(nitems, p.nthreads, p.executor) do task, items
@@ -152,7 +154,7 @@ function _∇conv_filter_impl!(
             _filter_work_item!(ybufs, wpartials, Val(MRc), Val(NRc), iv, ȳ, p, task, item)
         end
     end
-    _reduce_partials!(w̄, wpartials, ntasks, p, accumulate)
+    _reduce_partials!(w̄, wpartials, length(wpartials), p, accumulate)
     return w̄
 end
 

@@ -23,6 +23,8 @@ CacheAwareConv.dilation
 CacheAwareConv.spatial_dims
 CacheAwareConv.geometry
 CacheAwareConv.allocated_bytes
+CacheAwareConv.ConvKernel
+CacheAwareConv.ConvExecutor
 ```
 
 ## Geometry

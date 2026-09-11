@@ -75,20 +75,22 @@ function _check_strided(a::AbstractArray, name)
 end
 
 """
-    run_tasks(f, nitems, ntasks, exec = :spawn)
+    run_tasks(f, nitems, ntasks, exec = ExecSpawn)
 
-Call `f(task, items)` for contiguous chunks of `1:nitems` on `ntasks` tasks
-(inline when `ntasks == 1`). Each task index owns its own scratch buffers.
-`exec` is `:spawn` (`Threads.@spawn` over `@sync`) or `:polyester`
-(Polyester.jl `@batch`, provided by CacheAwareConvPolyesterExt).
+Call `f(task, items)` to cover `1:nitems` in at most `ntasks` parallel
+slices (inline when `ntasks == 1`). `task` is a scratch-buffer index the
+callback may use freely: a dense task number under `ExecSpawn`
+(`Threads.@spawn` over `@sync`) and `Threads.threadid()` under
+`ExecPolyester` (Polyester.jl `@batch` over the items themselves, provided
+by CacheAwareConvPolyesterExt). Plans size scratch buffers accordingly.
 """
-function run_tasks(f::F, nitems::Int, ntasks::Int, exec::Symbol = :spawn) where {F}
+function run_tasks(f::F, nitems::Int, ntasks::Int, exec::ConvExecutor = ExecSpawn) where {F}
     nt = max(1, min(ntasks, nitems))
     if nt == 1
         f(1, 1:nitems)
         return nothing
     end
-    exec === :polyester && return run_tasks_polyester(f, nitems, nt)
+    exec === ExecPolyester && return run_tasks_polyester(f, nitems, nt)
     chunk = cld(nitems, nt)
     @sync for t in 1:nt
         lo = (t - 1) * chunk + 1
@@ -302,9 +304,9 @@ Run the microkernel over `len` consecutive output positions: all full
         ydest, ybase::Int, ycs::Int, yps::Int, Xp, xbase::Int, p::ConvPlan, wbase::Int, K::Int, kc::Int
     ) where {SIMD, V, MR, NR, NP}
     kern = p.kernel
-    if kern === :lv
+    if kern === KernelLV
         return lv_tile_row!(Val(NR), Val(NP), acc, nr, len, ydest, ybase, ycs, yps, Xp, xbase, p, wbase, K, kc)
-    elseif kern === :scalar
+    elseif kern === KernelScalar
         # The scalar kernel's tile is MR scalars: same body with V == 1.
         return _tile_row_impl!(
             Val(false), Val(1), Val(MR), Val(NR), Val(NP), acc, nr, len,

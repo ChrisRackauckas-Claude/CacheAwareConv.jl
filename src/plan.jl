@@ -35,7 +35,8 @@ kernel when the compute type is vectorisable and the scalar kernel otherwise;
 LoopVectorization.jl `@turbo` kernel and requires `using LoopVectorization`.
 `executor` selects the task scheduler: `:spawn` (the default) uses
 `Threads.@spawn`; `:polyester` uses Polyester.jl `@batch` and requires
-`using Polyester`. Both are optimisation toggles: results are identical
+`using Polyester`. The `ConvKernel`/`ConvExecutor` enum values are accepted
+equivalently. Both are optimisation toggles: results are identical
 up to floating-point reassociation.
 
 See also [`plan_conv`](@ref), [`output_size`](@ref).
@@ -61,8 +62,8 @@ struct ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST}
     flat::Bool                    # flattened-row mode for narrow outputs (see conv.jl)
     stencil_bases::Vector{Int}    # row-blocked stencil path: per-group base offsets (empty otherwise)
     nthreads::Int
-    kernel::Symbol                # :simd, :scalar or :lv (microkernel selection)
-    executor::Symbol              # :spawn or :polyester (task scheduler)
+    kernel::ConvKernel
+    executor::ConvExecutor
     grad::GradSlot                # lazily built gradient state (see grad.jl)
     lock::ReentrantLock
 end
@@ -210,7 +211,7 @@ function ConvPlan(
         ::Type{T}, xsize::Dims{N}, wsize::Dims{N};
         stride = 1, pad = 0, dilation = 1, groups::Integer = 1, flipped::Bool = false,
         nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info(), gradients::Bool = false,
-        flat::Union{Nothing, Bool} = nothing, kernel::Symbol = :auto, executor::Symbol = :spawn
+        flat::Union{Nothing, Bool} = nothing, kernel = :auto, executor = :spawn
     ) where {T, N}
     g = ConvGeometry(xsize, wsize; stride, pad, dilation, groups, flipped)
     p = ConvPlan(T, g; nthreads, cache, flat, kernel, executor)
@@ -278,28 +279,48 @@ function stencil_taps(g::ConvGeometry{N, S}, ::Type{Tc}, NP::Int, SIMD::Bool, Lp
 end
 const MAX_STENCIL_TAPS = 169
 
-function _resolve_kernel(kernel::Symbol, SIMD::Bool, Tc::Type)
-    kernel in (:auto, :simd, :scalar, :lv) ||
-        throw(ArgumentError("kernel must be :auto, :simd, :scalar or :lv; got :$kernel"))
-    kernel === :auto && return SIMD ? :simd : :scalar
-    kernel in (:simd, :lv) && !SIMD &&
-        throw(ArgumentError("kernel = :$kernel requires a SIMD.jl-vectorisable compute type; got $Tc"))
-    if kernel === :lv && Base.get_extension(@__MODULE__, :CacheAwareConvLoopVectorizationExt) === nothing
+_kernel_enum(k::ConvKernel) = k
+function _kernel_enum(k::Symbol)
+    k === :auto && return KernelAuto
+    k === :simd && return KernelSIMD
+    k === :scalar && return KernelScalar
+    k === :lv && return KernelLV
+    throw(ArgumentError("kernel must be :auto, :simd, :scalar or :lv; got :$k"))
+end
+_kernel_enum(k) = throw(ArgumentError("kernel must be :auto, :simd, :scalar or :lv; got $k"))
+
+_kernel_sym(k::ConvKernel) = k === KernelLV ? :lv : k === KernelScalar ? :scalar : k === KernelAuto ? :auto : :simd
+
+function _resolve_kernel(kernel, SIMD::Bool, Tc::Type)
+    kern = _kernel_enum(kernel)
+    kern === KernelAuto && return SIMD ? KernelSIMD : KernelScalar
+    kern in (KernelSIMD, KernelLV) && !SIMD &&
+        throw(ArgumentError("kernel = $(_kernel_sym(kern)) requires a SIMD.jl-vectorisable compute type; got $Tc"))
+    if kern === KernelLV && Base.get_extension(@__MODULE__, :CacheAwareConvLoopVectorizationExt) === nothing
         throw(ArgumentError("kernel = :lv requires LoopVectorization.jl: run `using LoopVectorization`"))
     end
-    return kernel
+    return kern
 end
 
-function _resolve_executor(executor::Symbol)
-    executor in (:spawn, :polyester) ||
-        throw(ArgumentError("executor must be :spawn or :polyester; got :$executor"))
-    if executor === :polyester && Base.get_extension(@__MODULE__, :CacheAwareConvPolyesterExt) === nothing
+_executor_enum(e::ConvExecutor) = e
+_executor_enum(e::Symbol) = e === :spawn ? ExecSpawn : e === :polyester ? ExecPolyester :
+    throw(ArgumentError("executor must be :spawn or :polyester; got :$e"))
+_executor_enum(e) = throw(ArgumentError("executor must be :spawn or :polyester; got $e"))
+
+_executor_sym(e::ConvExecutor) = e === ExecPolyester ? :polyester : :spawn
+
+function _resolve_executor(executor)
+    exec = _executor_enum(executor)
+    exec === ExecPolyester && Base.get_extension(@__MODULE__, :CacheAwareConvPolyesterExt) === nothing &&
         throw(ArgumentError("executor = :polyester requires Polyester.jl: run `using Polyester`"))
-    end
-    return executor
+    return exec
 end
 
-function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info(), flat::Union{Nothing, Bool} = nothing, kernel::Symbol = :auto, executor::Symbol = :spawn) where {T, N, S, P}
+# Threads.nthreads() under the Polyester executor (scratch is indexed by the
+# executing thread's id, which can be anywhere in 1:nthreads); ntasks otherwise.
+nscratch(e::ConvExecutor, ntasks::Int) = e === ExecPolyester ? Threads.nthreads() : ntasks
+
+function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threads.nthreads(), cache::CacheInfo = cache_info(), flat::Union{Nothing, Bool} = nothing, kernel = :auto, executor = :spawn) where {T, N, S, P}
     T <: Number || throw(ArgumentError("element type must be a Number, got $T"))
     Tc = compute_type(T)
     NP = nplanes(T)
@@ -313,7 +334,7 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     useflat = flat === nothing ? use_flat_mode(g, tile, V, MR) : (flat && S >= 2 && all(==(1), g.stride))
     Lp, W1, R = _packed_extents(g, tile, V, useflat)
     stencil, sbases = stencil_taps(g, Tc, NP, SIMD, Lp, R)
-    if stencil !== nothing && (useflat || !(Tc === T) || kern !== :simd)
+    if stencil !== nothing && (useflat || !(Tc === T) || kern !== KernelSIMD)
         stencil, sbases = nothing, Int[]     # stencil path needs the direct, row-wise SIMD kernel
     end
     xci_stride = prod(R)
@@ -334,8 +355,9 @@ function ConvPlan(::Type{T}, g::ConvGeometry{N, S, P}; nthreads::Integer = Threa
     Wp = Vector{Tc}(undef, packed_weight_length(g, NP))
     # Zero-initialised: the flat-mode slack past the last row is read (and
     # multiplied by zeros) but never written, so it must not hold NaNs.
-    xbufs = [zeros(Tc, xbuf_len) for _ in 1:ntasks]
-    ybufs = [Vector{Tc}(undef, ybuf_len) for _ in 1:(direct ? 0 : ntasks)]
+    nbuf = nscratch(exec, ntasks)
+    xbufs = [zeros(Tc, xbuf_len) for _ in 1:nbuf]
+    ybufs = [Vector{Tc}(undef, ybuf_len) for _ in 1:(direct ? 0 : nbuf)]
     return ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD, stencil}(
         g, cache, Kc, Nc, tile, map(cld, ntuple(i -> g.ysize[i], Val(S)), tile), Lp, W1, R,
         xci_stride, xplane_stride, Lpy, taps, Wp, xbufs, ybufs, direct, useflat, sbases, ntasks, kern, exec, GradSlot(nothing), ReentrantLock()
@@ -397,7 +419,7 @@ function Base.show(io::IO, p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD, ST})
     print(io, "; stride=", g.stride, ", pad=", g.pad, ", dilation=", g.dilation, ", groups=", g.groups, ", flipped=", g.flipped)
     print(io, ") [", SIMD ? "SIMD " : "scalar ", Tc, " V=", V, " MR=", MR, " NR=", NR, " NP=", NP)
     print(io, " Kc=", p.Kc, " Nc=", p.Nc, " tile=", p.tile, p.flat ? " flat" : "", ST === nothing ? "" : " stencil", " tasks=", p.nthreads)
-    print(io, p.kernel === :simd ? "" : " kernel=$(p.kernel)", p.executor === :spawn ? "" : " executor=$(p.executor)", "]")
+    print(io, p.kernel === KernelSIMD ? "" : " kernel=$(_kernel_sym(p.kernel))", p.executor === ExecSpawn ? "" : " executor=$(_executor_sym(p.executor))", "]")
     return nothing
 end
 
