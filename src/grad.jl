@@ -77,7 +77,7 @@ function grad_state(p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP}) where {T, Tc, N,
         if st2 === nothing
             g = p.geom
             gt = transposed_geometry(g)
-            data_plan = ConvPlan(T, gt; nthreads = p.nthreads, cache = p.cache)
+            data_plan = ConvPlan(T, gt; nthreads = p.nthreads, cache = p.cache, kernel = p.kernel, executor = p.executor)
             cout_g = channels_out(g) ÷ g.groups
             _, ycostride = _ybuf_geometry(p)
             ylen = ycostride * cout_g * NP + V     # slack for flat-mode reads past the end
@@ -147,7 +147,7 @@ function _∇conv_filter_impl!(
     for t in 1:ntasks
         fill!(wpartials[t], zero(Tc))
     end
-    run_tasks(nitems, p.nthreads) do task, items
+    run_tasks(nitems, p.nthreads, p.executor) do task, items
         for item in items
             _filter_work_item!(ybufs, wpartials, Val(MRc), Val(NRc), iv, ȳ, p, task, item)
         end

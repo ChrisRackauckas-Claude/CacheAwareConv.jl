@@ -75,17 +75,20 @@ function _check_strided(a::AbstractArray, name)
 end
 
 """
-    run_tasks(f, nitems, ntasks)
+    run_tasks(f, nitems, ntasks, exec = :spawn)
 
 Call `f(task, items)` for contiguous chunks of `1:nitems` on `ntasks` tasks
 (inline when `ntasks == 1`). Each task index owns its own scratch buffers.
+`exec` is `:spawn` (`Threads.@spawn` over `@sync`) or `:polyester`
+(Polyester.jl `@batch`, provided by CacheAwareConvPolyesterExt).
 """
-function run_tasks(f::F, nitems::Int, ntasks::Int) where {F}
+function run_tasks(f::F, nitems::Int, ntasks::Int, exec::Symbol = :spawn) where {F}
     nt = max(1, min(ntasks, nitems))
     if nt == 1
         f(1, 1:nitems)
         return nothing
     end
+    exec === :polyester && return run_tasks_polyester(f, nitems, nt)
     chunk = cld(nitems, nt)
     @sync for t in 1:nt
         lo = (t - 1) * chunk + 1
@@ -94,6 +97,12 @@ function run_tasks(f::F, nitems::Int, ntasks::Int) where {F}
         Threads.@spawn f(t, lo:hi)
     end
     return nothing
+end
+
+# Intentionally untyped: the extension's method must be strictly more specific
+# (defining an identical signature from another module is a hard error).
+function run_tasks_polyester(f, nitems, ntasks)
+    throw(ArgumentError("executor = :polyester requires Polyester.jl: run `using Polyester`"))
 end
 
 # Decode work item `item` (1-based) into batch index and 0-based tile origin.
@@ -129,9 +138,9 @@ function _conv_impl!(
         p::ConvPlan{T, Tc, N, S, P, V, MR, NR, NP, SIMD}, bias, σ::F, conjw::Bool, accumulate::Bool
     ) where {T, Tc, N, S, P, V, MR, NR, NP, SIMD, F}
     g = p.geom
-    pack_weights!(p.Wp, w, g, p.Kc, NR, Val(NP), conjw; ntasks = p.nthreads)
+    pack_weights!(p.Wp, w, g, p.Kc, NR, Val(NP), conjw; ntasks = p.nthreads, exec = p.executor)
     nitems = batch_size(g) * prod(p.nblocks)
-    run_tasks(nitems, p.nthreads) do task, items
+    run_tasks(nitems, p.nthreads, p.executor) do task, items
         for item in items
             _work_item!(y, iv, p, bias, σ, accumulate, task, item)
         end
@@ -289,6 +298,26 @@ Run the microkernel over `len` consecutive output positions: all full
 `MR*V` tiles in a single call, then one (possibly masked) call for the tail.
 """
 @inline function _tile_row!(
+        ::Val{SIMD}, ::Val{V}, ::Val{MR}, ::Val{NR}, ::Val{NP}, acc::Bool, nr::Int, len::Int,
+        ydest, ybase::Int, ycs::Int, yps::Int, Xp, xbase::Int, p::ConvPlan, wbase::Int, K::Int, kc::Int
+    ) where {SIMD, V, MR, NR, NP}
+    kern = p.kernel
+    if kern === :lv
+        return lv_tile_row!(Val(NR), Val(NP), acc, nr, len, ydest, ybase, ycs, yps, Xp, xbase, p, wbase, K, kc)
+    elseif kern === :scalar
+        # The scalar kernel's tile is MR scalars: same body with V == 1.
+        return _tile_row_impl!(
+            Val(false), Val(1), Val(MR), Val(NR), Val(NP), acc, nr, len,
+            ydest, ybase, ycs, yps, Xp, xbase, p, wbase, K, kc
+        )
+    end
+    return _tile_row_impl!(
+        Val(SIMD), Val(V), Val(MR), Val(NR), Val(NP), acc, nr, len,
+        ydest, ybase, ycs, yps, Xp, xbase, p, wbase, K, kc
+    )
+end
+
+@inline function _tile_row_impl!(
         ::Val{SIMD}, ::Val{V}, ::Val{MR}, ::Val{NR}, ::Val{NP}, acc::Bool, nr::Int, len::Int,
         ydest, ybase::Int, ycs::Int, yps::Int, Xp, xbase::Int, p::ConvPlan, wbase::Int, K::Int, kc::Int
     ) where {SIMD, V, MR, NR, NP}

@@ -299,6 +299,15 @@ vectors and `nr ≤ NR` channels (a partial tile is always a single repetition).
     end
 end
 
+# LoopVectorization.jl microkernel (CacheAwareConvLoopVectorizationExt): same
+# contract as the `dispatch_microkernel!` row path but computes `len`
+# consecutive output positions in one `@turbo` call, with no register tile or
+# mask — LoopVectorization handles tiling and tails itself. Reached through
+# `_tile_row!` when the plan was built with `kernel = :lv`.
+function lv_tile_row!(::Val{NR}, ::Val{NP}, acc, nr, len, ydest, ybase, ycs, yps, Xp, xbase, p, wbase, K, kc) where {NR, NP}
+    throw(ArgumentError("kernel = :lv requires LoopVectorization.jl: run `using LoopVectorization`"))
+end
+
 """
     lane_mask(::Val{V}, n) -> Vec{V, Bool}
 

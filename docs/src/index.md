@@ -63,6 +63,11 @@ cross-correlation.
   (so Zygote works).
 - Drop-in layers for [Lux.jl](https://github.com/LuxDL/Lux.jl) and
   [Flux.jl](https://github.com/FluxML/Flux.jl) through package extensions.
+- Optional package extensions: `kernel = :lv` runs a
+  [LoopVectorization.jl](https://github.com/JuliaSIMD/LoopVectorization.jl)
+  `@turbo` microkernel, and `executor = :polyester` schedules work with
+  [Polyester.jl](https://github.com/JuliaSIMD/Polyester.jl) `@batch`
+  (see [`ConvPlan`](@ref)).
 - Works on 32-bit Julia.
 
 ## Contributing
